@@ -48,6 +48,9 @@ cargo check
 
 `sudo cargo run -p landscape-scx-agent -- unload-scheduler --config ./configs/landscape-scx.toml`
 
+By default `scheduler.start_command = []`, and agent auto-detects a scheduler binary
+from PATH (`scx_bpfland`, `scx_lavd`, `scx_rustland`, ...). You can also set an explicit command.
+
 ## Integration With Landscape
 
 Default discovery targets:

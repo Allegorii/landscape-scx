@@ -150,7 +150,7 @@ fn default_scheduler_mode() -> SchedulerMode {
 }
 
 fn default_scheduler_start_command() -> Vec<String> {
-    vec!["scx_simple".to_string(), "--partial".to_string()]
+    Vec::new()
 }
 
 fn default_scheduler_pid_file() -> PathBuf {

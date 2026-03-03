@@ -14,8 +14,9 @@ apply_sched_ext = true
 
 [scheduler]
 mode = "external_command"
-# Use an external scheduler implementation first (e.g. from sched-ext/scx).
-start_command = ["scx_simple", "--partial"]
+# If empty, agent auto-detects one of common sched-ext binaries in PATH
+# (scx_bpfland/scx_lavd/scx_rustland/...).
+start_command = []
 # Optional explicit stop command. If empty, agent uses pid_file + SIGTERM.
 stop_command = []
 pid_file = "/run/landscape-scx/scheduler.pid"

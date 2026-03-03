@@ -38,18 +38,15 @@ fn ensure_external_scheduler(cfg: &SchedulerConfig) -> Result<()> {
         return Ok(());
     }
 
-    if cfg.start_command.is_empty() {
-        anyhow::bail!("scheduler.start_command is empty");
+    let (program, args) = resolve_start_command(cfg)?;
+    let mut cmd = Command::new(&program);
+    if !args.is_empty() {
+        cmd.args(&args);
     }
 
-    let mut cmd = Command::new(&cfg.start_command[0]);
-    if cfg.start_command.len() > 1 {
-        cmd.args(&cfg.start_command[1..]);
-    }
-
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn scheduler command: {:?}", cfg.start_command))?;
+    let child = cmd.spawn().with_context(|| {
+        format!("failed to spawn scheduler command: program={} args={:?}", program, args)
+    })?;
 
     if let Some(parent) = cfg.pid_file.parent() {
         fs::create_dir_all(parent)
@@ -59,6 +56,48 @@ fn ensure_external_scheduler(cfg: &SchedulerConfig) -> Result<()> {
         .with_context(|| format!("failed to write pid file: {}", cfg.pid_file.display()))?;
 
     wait_for_sched_ext(cfg.ready_timeout_ms)
+}
+
+fn resolve_start_command(cfg: &SchedulerConfig) -> Result<(String, Vec<String>)> {
+    if !cfg.start_command.is_empty() {
+        let program = cfg.start_command[0].clone();
+        let args = cfg.start_command[1..].to_vec();
+        return Ok((program, args));
+    }
+
+    // Auto-detect common sched-ext schedulers shipped by recent scx packages.
+    let candidates = [
+        "scx_bpfland",
+        "scx_lavd",
+        "scx_rustland",
+        "scx_rlfifo",
+        "scx_central",
+        "scx_flatcg",
+        "scx_nest",
+        "scx_pair",
+        "scx_qmap",
+    ];
+
+    for bin in candidates {
+        if executable_in_path(bin) {
+            return Ok((bin.to_string(), Vec::new()));
+        }
+    }
+
+    anyhow::bail!(
+        "no scheduler command configured and no known scx binary found in PATH; set scheduler.start_command explicitly"
+    )
+}
+
+fn executable_in_path(bin: &str) -> bool {
+    if bin.contains('/') {
+        return Path::new(bin).exists();
+    }
+
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|p| p.join(bin).exists())
 }
 
 fn unload_external_scheduler(cfg: &SchedulerConfig) -> Result<()> {
