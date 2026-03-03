@@ -124,11 +124,14 @@ fn apply_partial_switch(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     if dry_run || !cfg.policy.apply_sched_ext {
         info!("dry-run mode, no sched_setattr syscall will be issued");
         for c in list {
+            let affinity_note =
+                if should_skip_affinity(&c.comm) { "affinity=skip" } else { "affinity=apply" };
             println!(
-                "[DRY] apply SCHED_EXT tid={} comm={} cpus={:?}",
+                "[DRY] apply SCHED_EXT tid={} comm={} cpus={:?} {}",
                 c.tid,
                 c.comm,
-                target_cpu_set(cfg, &c.comm)
+                target_cpu_set(cfg, &c.comm),
+                affinity_note
             );
         }
         return Ok(());
@@ -139,8 +142,10 @@ fn apply_partial_switch(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
 
     for c in list {
         let cpus = target_cpu_set(cfg, &c.comm);
-        if let Err(e) = try_set_cpu_affinity(c.tid, &cpus) {
-            warn!("affinity failed tid={} comm={} err={}", c.tid, c.comm, e);
+        if !should_skip_affinity(&c.comm) {
+            if let Err(e) = try_set_cpu_affinity(c.tid, &cpus) {
+                warn!("affinity failed tid={} comm={} err={}", c.tid, c.comm, e);
+            }
         }
         match try_set_sched_ext(c.tid) {
             Ok(_) => {
@@ -171,6 +176,10 @@ fn target_cpu_set(cfg: &ScxConfig, comm: &str) -> Vec<usize> {
         return cfg.policy.forwarding_cpus.clone();
     }
     cfg.policy.control_cpus.clone()
+}
+
+fn should_skip_affinity(comm: &str) -> bool {
+    comm.starts_with("ksoftirqd/")
 }
 
 fn ensure_scheduler_with_fallback(cfg: &ScxConfig) -> Result<()> {
