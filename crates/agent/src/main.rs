@@ -8,7 +8,8 @@ use landscape_scx_bpf::{
     ensure_scheduler, read_sched_ext_state, sched_ext_enabled, unload_scheduler,
 };
 use landscape_scx_common::{
-    discover_candidates, load_config, try_set_cpu_affinity, try_set_sched_ext, ScxConfig,
+    discover_candidates, load_config, read_online_cpus, try_set_cpu_affinity, try_set_sched_ext,
+    validate_cpu_config, ScxConfig,
 };
 use tracing::{error, info, warn};
 
@@ -41,6 +42,10 @@ enum Command {
         #[arg(long, default_value = "/etc/landscape-scx/config.toml")]
         config: PathBuf,
     },
+    Validate {
+        #[arg(long, default_value = "/etc/landscape-scx/config.toml")]
+        config: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -56,6 +61,7 @@ fn main() -> Result<()> {
         Command::Status { config } => status(config),
         Command::LoadScheduler { config } => load_scheduler(config),
         Command::UnloadScheduler { config } => unload_scheduler_cmd(config),
+        Command::Validate { config } => validate(config),
     }
 }
 
@@ -93,8 +99,17 @@ fn unload_scheduler_cmd(config: PathBuf) -> Result<()> {
     unload_scheduler(&cfg.scheduler)
 }
 
+fn validate(config: PathBuf) -> Result<()> {
+    let cfg = load_or_default(config)?;
+    validate_cpu_config(&cfg)?;
+    let online = read_online_cpus()?;
+    info!("config validation passed; online_cpus={:?}", online);
+    Ok(())
+}
+
 fn run(config: PathBuf, dry_run: bool, once: bool) -> Result<()> {
     let cfg = load_or_default(config)?;
+    validate_cpu_config(&cfg)?;
 
     if !dry_run {
         ensure_scheduler_with_fallback(&cfg)?;

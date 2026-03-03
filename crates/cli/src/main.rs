@@ -35,6 +35,10 @@ enum Cmd {
         #[arg(long, default_value = "/etc/landscape-scx/config.toml")]
         config: PathBuf,
     },
+    Validate {
+        #[arg(long, default_value = "/etc/landscape-scx/config.toml")]
+        config: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -60,6 +64,9 @@ fn main() -> ExitCode {
         }
         Cmd::UnloadScheduler { config } => {
             cmd.arg("unload-scheduler").arg("--config").arg(config);
+        }
+        Cmd::Validate { config } => {
+            cmd.arg("validate").arg("--config").arg(config);
         }
     }
 

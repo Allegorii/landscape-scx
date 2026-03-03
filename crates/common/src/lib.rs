@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -348,4 +349,68 @@ pub fn try_set_cpu_affinity(tid: i32, cpus: &[usize]) -> Result<()> {
 
     let err = io::Error::last_os_error();
     Err(anyhow::anyhow!("sched_setaffinity tid={} cpus={:?} failed: {}", tid, cpus, err))
+}
+
+pub fn read_online_cpus() -> Result<BTreeSet<usize>> {
+    let raw = fs::read_to_string("/sys/devices/system/cpu/online")
+        .context("failed to read /sys/devices/system/cpu/online")?;
+    parse_cpu_list(raw.trim())
+}
+
+pub fn validate_cpu_config(cfg: &ScxConfig) -> Result<()> {
+    let online = read_online_cpus()?;
+
+    validate_cpu_set("policy.forwarding_cpus", &cfg.policy.forwarding_cpus, &online)?;
+    validate_cpu_set("policy.control_cpus", &cfg.policy.control_cpus, &online)?;
+
+    for (idx, class) in cfg.policy.thread_cpu_classes.iter().enumerate() {
+        if class.thread_name_prefix.trim().is_empty() {
+            anyhow::bail!("policy.thread_cpu_classes[{idx}].thread_name_prefix is empty");
+        }
+        validate_cpu_set(&format!("policy.thread_cpu_classes[{idx}].cpus"), &class.cpus, &online)?;
+    }
+
+    Ok(())
+}
+
+fn validate_cpu_set(name: &str, cpus: &[usize], online: &BTreeSet<usize>) -> Result<()> {
+    if cpus.is_empty() {
+        anyhow::bail!("{name} is empty");
+    }
+    for cpu in cpus {
+        if !online.contains(cpu) {
+            anyhow::bail!(
+                "{name} contains cpu {} which is not online; online cpus are {:?}",
+                cpu,
+                online
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
+    let mut out = BTreeSet::new();
+    for part in raw.split(',').filter(|s| !s.trim().is_empty()) {
+        let token = part.trim();
+        if let Some((start_s, end_s)) = token.split_once('-') {
+            let start: usize =
+                start_s.parse().with_context(|| format!("invalid cpu range: {token}"))?;
+            let end: usize =
+                end_s.parse().with_context(|| format!("invalid cpu range: {token}"))?;
+            if start > end {
+                anyhow::bail!("invalid cpu range: {token}");
+            }
+            for c in start..=end {
+                out.insert(c);
+            }
+        } else {
+            let cpu: usize = token.parse().with_context(|| format!("invalid cpu id: {token}"))?;
+            out.insert(cpu);
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("parsed online cpu list is empty from input: {raw}");
+    }
+    Ok(out)
 }
