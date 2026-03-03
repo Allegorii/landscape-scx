@@ -12,7 +12,7 @@ thread_cpu_classes = []
 
 [scheduler]
 mode = "external_command"
-start_command = []
+start_command = ["scx_cosmos"]
 stop_command = []
 pid_file = "/run/landscape-scx/scheduler.pid"
 ready_timeout_ms = 3000
