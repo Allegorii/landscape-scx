@@ -15,7 +15,7 @@ Use the helper script to rotate scheduler binaries and compare basic kernel metr
 ```bash
 sudo ./scripts/bench_schedulers.sh \
   --config ./configs/profiles/throughput-16c.toml \
-  --schedulers scx_bpfland,scx_lavd,scx_rustland \
+  --schedulers native,scx_bpfland,scx_lavd,scx_rustland \
   --duration 30 --warmup 5
 ```
 
@@ -24,7 +24,7 @@ sudo ./scripts/bench_schedulers.sh \
 ```bash
 sudo ./scripts/bench_schedulers_full.sh \
   --config ./configs/profiles/throughput-16c.toml \
-  --schedulers scx_bpfland,scx_lavd,scx_rustland \
+  --schedulers native,scx_bpfland,scx_lavd,scx_rustland \
   --duration 60 --warmup 10 \
   --iface eth0 --ping-target 1.1.1.1 \
   --workload-cmd \"iperf3 -c 192.168.1.2 -t 60 -P 4\"
@@ -37,6 +37,22 @@ This mode also outputs:
 - markdown report with quick winner summary
   - throughput-first recommendation
   - latency-first recommendation (guards against high max latency outliers)
+
+`native` in scheduler list means CFS baseline (sched_ext unloaded).
+`--ping-target` is optional; if omitted, latency fields are marked as `na`.
+
+## Multi-interface summary mode
+
+```bash
+sudo ./scripts/bench_schedulers_multi.sh \
+  --config ./configs/profiles/throughput-16c.toml \
+  --schedulers native,scx_cosmos,scx_rusty \
+  --duration 60 --warmup 10 \
+  --ifaces ens18,ens19
+```
+
+This mode aggregates throughput across multiple interfaces and also outputs
+per-interface throughput breakdown fields in CSV/Markdown.
 
 ## Output
 

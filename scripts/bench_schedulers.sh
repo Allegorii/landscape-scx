@@ -19,6 +19,7 @@ Options:
   --warmup <sec>          Warmup before measurement (default: $WARMUP_SECS)
   --schedulers <list>     Comma-separated scheduler binaries
                           (default: $SCHEDULERS)
+                          special token: native (CFS baseline)
   --agent-bin <path>      landscape-scx-agent binary path
   --out-dir <path>        Output directory (default: $OUT_DIR)
 
@@ -112,6 +113,47 @@ write_temp_config() {
 
 run_case() {
   local sched="$1"
+
+  if [[ "$sched" == "native" ]]; then
+    echo "[case] native (CFS baseline)" | tee -a "$LOG"
+    "$AGENT_BIN" unload-scheduler --config "$CONFIG_PATH" >/dev/null 2>&1 || true
+    sleep "$WARMUP_SECS"
+
+    local cpu_before total_before busy_before idle_before
+    read -r total_before busy_before idle_before < <(read_cpu_stat)
+    local rx_before tx_before ctxt_before
+    rx_before="$(sum_softirq_line NET_RX)"
+    tx_before="$(sum_softirq_line NET_TX)"
+    ctxt_before="$(read_ctxt)"
+
+    sleep "$DURATION_SECS"
+
+    local state
+    state="$(cat /sys/kernel/sched_ext/state 2>/dev/null || echo unknown)"
+    local total_after busy_after idle_after
+    read -r total_after busy_after idle_after < <(read_cpu_stat)
+    local rx_after tx_after ctxt_after
+    rx_after="$(sum_softirq_line NET_RX)"
+    tx_after="$(sum_softirq_line NET_TX)"
+    ctxt_after="$(read_ctxt)"
+
+    local total_delta busy_delta util
+    total_delta=$((total_after - total_before))
+    busy_delta=$((busy_after - busy_before))
+    if [[ "$total_delta" -gt 0 ]]; then
+      util="$(awk -v b="$busy_delta" -v t="$total_delta" 'BEGIN{printf "%.2f", (b*100.0)/t}')"
+    else
+      util="0.00"
+    fi
+
+    local rx_delta tx_delta ctxt_delta
+    rx_delta=$((rx_after - rx_before))
+    tx_delta=$((tx_after - tx_before))
+    ctxt_delta=$((ctxt_after - ctxt_before))
+
+    echo "native,true,$state,$util,$rx_delta,$tx_delta,$ctxt_delta" >> "$CSV"
+    return 0
+  fi
 
   if ! command -v "$sched" >/dev/null 2>&1; then
     echo "[skip] scheduler not found in PATH: $sched" | tee -a "$LOG"
