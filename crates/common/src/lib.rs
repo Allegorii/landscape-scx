@@ -39,6 +39,14 @@ pub struct PolicyConfig {
     pub manage_ksoftirqd: bool,
     #[serde(default = "default_enable_sched_ext")]
     pub apply_sched_ext: bool,
+    #[serde(default)]
+    pub thread_cpu_classes: Vec<ThreadCpuClass>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadCpuClass {
+    pub thread_name_prefix: String,
+    pub cpus: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +106,7 @@ impl Default for PolicyConfig {
             control_cpus: default_control_cpus(),
             manage_ksoftirqd: default_enable_ksoftirqd(),
             apply_sched_ext: default_enable_sched_ext(),
+            thread_cpu_classes: Vec::new(),
         }
     }
 }

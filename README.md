@@ -42,6 +42,23 @@ cargo check
 
 `sudo cargo run -p landscape-scx-agent -- run --config ./configs/landscape-scx.toml`
 
+## Thread-Class CPU placement
+
+You can pin different thread groups to different CPU sets by prefix matching:
+
+```toml
+[policy]
+thread_cpu_classes = [
+  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3] },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [4] },
+  { thread_name_prefix = "r2d2-worker-", cpus = [5] },
+]
+```
+
+Resolution order is first-match wins. If no class matches, fallback is:
+- `ksoftirqd/*` -> `forwarding_cpus`
+- others -> `control_cpus`
+
 ## Scheduler lifecycle
 
 `sudo cargo run -p landscape-scx-agent -- load-scheduler --config ./configs/landscape-scx.toml`

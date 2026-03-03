@@ -11,6 +11,13 @@ forwarding_cpus = [0, 1]
 control_cpus = [2, 3]
 manage_ksoftirqd = true
 apply_sched_ext = true
+# Optional per-thread-name CPU classes (prefix match, first match wins).
+# Useful to separate runtime/database workers and reduce contention.
+thread_cpu_classes = [
+  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3] },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [4] },
+  { thread_name_prefix = "r2d2-worker-", cpus = [5] },
+]
 
 [scheduler]
 mode = "external_command"

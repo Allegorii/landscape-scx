@@ -166,6 +166,10 @@ fn apply_partial_switch(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
 }
 
 fn target_cpu_set(cfg: &ScxConfig, comm: &str) -> Vec<usize> {
+    if let Some(cpus) = class_cpu_set(cfg, comm) {
+        return cpus;
+    }
+
     if comm.starts_with("ksoftirqd/") {
         if cfg.policy.forwarding_cpus.is_empty() {
             return cfg.policy.control_cpus.clone();
@@ -176,6 +180,16 @@ fn target_cpu_set(cfg: &ScxConfig, comm: &str) -> Vec<usize> {
         return cfg.policy.forwarding_cpus.clone();
     }
     cfg.policy.control_cpus.clone()
+}
+
+fn class_cpu_set(cfg: &ScxConfig, comm: &str) -> Option<Vec<usize>> {
+    cfg.policy
+        .thread_cpu_classes
+        .iter()
+        .find(|class| {
+            !class.thread_name_prefix.is_empty() && comm.starts_with(&class.thread_name_prefix)
+        })
+        .and_then(|class| if class.cpus.is_empty() { None } else { Some(class.cpus.clone()) })
 }
 
 fn should_skip_affinity(comm: &str) -> bool {
