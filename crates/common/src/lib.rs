@@ -351,6 +351,28 @@ pub fn try_set_cpu_affinity(tid: i32, cpus: &[usize]) -> Result<()> {
     Err(anyhow::anyhow!("sched_setaffinity tid={} cpus={:?} failed: {}", tid, cpus, err))
 }
 
+pub fn get_sched_policy(tid: i32) -> Result<i32> {
+    let policy = unsafe { libc::sched_getscheduler(tid) };
+    if policy >= 0 {
+        return Ok(policy);
+    }
+    let err = io::Error::last_os_error();
+    Err(anyhow::anyhow!("sched_getscheduler tid={} failed: {}", tid, err))
+}
+
+pub fn sched_policy_name(policy: i32) -> &'static str {
+    match policy {
+        0 => "SCHED_OTHER",
+        1 => "SCHED_FIFO",
+        2 => "SCHED_RR",
+        3 => "SCHED_BATCH",
+        5 => "SCHED_IDLE",
+        6 => "SCHED_DEADLINE",
+        7 => "SCHED_EXT",
+        _ => "UNKNOWN",
+    }
+}
+
 pub fn read_online_cpus() -> Result<BTreeSet<usize>> {
     let raw = fs::read_to_string("/sys/devices/system/cpu/online")
         .context("failed to read /sys/devices/system/cpu/online")?;

@@ -8,8 +8,8 @@ use landscape_scx_bpf::{
     ensure_scheduler, read_sched_ext_state, sched_ext_enabled, unload_scheduler,
 };
 use landscape_scx_common::{
-    discover_candidates, load_config, read_online_cpus, try_set_cpu_affinity, try_set_sched_ext,
-    validate_cpu_config, ScxConfig,
+    discover_candidates, get_sched_policy, load_config, read_online_cpus, sched_policy_name,
+    try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config, ScxConfig,
 };
 use tracing::{error, info, warn};
 
@@ -46,6 +46,10 @@ enum Command {
         #[arg(long, default_value = "/etc/landscape-scx/config.toml")]
         config: PathBuf,
     },
+    Health {
+        #[arg(long, default_value = "/etc/landscape-scx/config.toml")]
+        config: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -62,6 +66,7 @@ fn main() -> Result<()> {
         Command::LoadScheduler { config } => load_scheduler(config),
         Command::UnloadScheduler { config } => unload_scheduler_cmd(config),
         Command::Validate { config } => validate(config),
+        Command::Health { config } => health(config),
     }
 }
 
@@ -121,6 +126,53 @@ fn run(config: PathBuf, dry_run: bool, once: bool) -> Result<()> {
             break;
         }
         thread::sleep(Duration::from_secs(cfg.agent.apply_interval_secs));
+    }
+
+    Ok(())
+}
+
+fn health(config: PathBuf) -> Result<()> {
+    let cfg = load_or_default(config)?;
+    let self_pid = std::process::id() as i32;
+    let list: Vec<_> =
+        discover_candidates(&cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
+
+    let state = std::fs::read_to_string("/sys/kernel/sched_ext/state")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let ops = std::fs::read_to_string("/sys/kernel/sched_ext/root/ops")
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let mut counts = std::collections::BTreeMap::<i32, usize>::new();
+    let mut failed = 0usize;
+    for c in &list {
+        match get_sched_policy(c.tid) {
+            Ok(p) => {
+                *counts.entry(p).or_insert(0) += 1;
+            }
+            Err(_) => {
+                failed += 1;
+            }
+        }
+    }
+
+    println!("sched_ext_state={}", state.trim());
+    println!("sched_ext_ops={}", ops.trim());
+    println!("matched_threads={}", list.len());
+    println!("policy_distribution:");
+    for (policy, cnt) in &counts {
+        println!("  {} ({}) = {}", policy, sched_policy_name(*policy), cnt);
+    }
+    if failed > 0 {
+        println!("  read_failed = {}", failed);
+    }
+
+    let ext_count = *counts.get(&7).unwrap_or(&0usize);
+    println!("sched_ext_threads={}", ext_count);
+
+    if ext_count == 0 {
+        warn!("no matched thread is currently in SCHED_EXT");
+    } else {
+        info!("health check passed: {} matched threads in SCHED_EXT", ext_count);
     }
 
     Ok(())

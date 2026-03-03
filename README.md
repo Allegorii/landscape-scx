@@ -69,6 +69,10 @@ Resolution order is first-match wins. If no class matches, fallback is:
 
 `cargo run -p landscape-scx-agent -- validate --config ./configs/landscape-scx.toml`
 
+## Health check
+
+`cargo run -p landscape-scx-agent -- health --config ./configs/landscape-scx.toml`
+
 By default `scheduler.start_command = ["scx_cosmos"]`.
 You can set another explicit scheduler command if needed.
 
