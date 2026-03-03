@@ -93,6 +93,18 @@ This installs:
 - `/etc/landscape-scx/config.toml`
 - `/etc/systemd/system/landscape-scx.service`
 
+## Benchmark schedulers
+
+Use the benchmark helper to compare different `scx_*` schedulers quickly:
+
+`sudo ./scripts/bench_schedulers.sh --config ./configs/profiles/throughput-16c.toml --schedulers scx_bpfland,scx_lavd --duration 30`
+
+See `docs/benchmark.md` for details.
+
+For full report mode (throughput + latency + markdown summary):
+
+`sudo ./scripts/bench_schedulers_full.sh --config ./configs/profiles/throughput-16c.toml --schedulers scx_bpfland,scx_lavd,scx_rustland --duration 60 --iface eth0 --ping-target 1.1.1.1 --workload-cmd \"iperf3 -c 192.168.1.2 -t 60 -P 4\"`
+
 ## Prebuilt Profiles
 
 Common profile templates are available under:
