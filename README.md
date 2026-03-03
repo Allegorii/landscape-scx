@@ -101,7 +101,7 @@ This installs:
 
 Use the benchmark helper to compare different `scx_*` schedulers quickly:
 
-`sudo ./scripts/bench_schedulers.sh --config ./configs/profiles/throughput-16c.toml --schedulers scx_bpfland,scx_lavd --duration 30`
+`sudo ./scripts/bench_schedulers.sh --config ./configs/profiles/throughput-16c.toml --schedulers scx_bpfland,scx_lavd --duration 30 --warmup 5`
 
 See `docs/benchmark.md` for details.
 

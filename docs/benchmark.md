@@ -16,7 +16,7 @@ Use the helper script to rotate scheduler binaries and compare basic kernel metr
 sudo ./scripts/bench_schedulers.sh \
   --config ./configs/profiles/throughput-16c.toml \
   --schedulers scx_bpfland,scx_lavd,scx_rustland \
-  --duration 30
+  --duration 30 --warmup 5
 ```
 
 ## Full report mode

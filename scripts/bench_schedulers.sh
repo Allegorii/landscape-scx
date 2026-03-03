@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEFAULT_CONFIG="$ROOT_DIR/configs/landscape-scx.toml"
 AGENT_BIN_DEFAULT=""
 DURATION_SECS=30
+WARMUP_SECS=5
 SCHEDULERS="scx_bpfland,scx_lavd,scx_rustland"
 OUT_DIR="$ROOT_DIR/output/bench"
 
@@ -15,6 +16,7 @@ Usage: sudo $0 [options]
 Options:
   --config <path>         Base config file (default: $DEFAULT_CONFIG)
   --duration <sec>        Duration per scheduler (default: $DURATION_SECS)
+  --warmup <sec>          Warmup before measurement (default: $WARMUP_SECS)
   --schedulers <list>     Comma-separated scheduler binaries
                           (default: $SCHEDULERS)
   --agent-bin <path>      landscape-scx-agent binary path
@@ -22,7 +24,7 @@ Options:
 
 Example:
   sudo $0 --config ./configs/profiles/throughput-16c.toml \
-    --schedulers scx_bpfland,scx_lavd --duration 20
+    --schedulers scx_bpfland,scx_lavd --duration 20 --warmup 5
 USAGE
 }
 
@@ -33,6 +35,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_PATH="$2"; shift 2 ;;
     --duration) DURATION_SECS="$2"; shift 2 ;;
+    --warmup) WARMUP_SECS="$2"; shift 2 ;;
     --schedulers) SCHEDULERS="$2"; shift 2 ;;
     --agent-bin) AGENT_BIN="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
@@ -73,7 +76,7 @@ echo "== landscape-scx benchmark ==" | tee -a "$LOG"
 echo "time: $(date -Is)" | tee -a "$LOG"
 echo "config: $CONFIG_PATH" | tee -a "$LOG"
 echo "agent: $AGENT_BIN" | tee -a "$LOG"
-echo "duration_per_scheduler: ${DURATION_SECS}s" | tee -a "$LOG"
+echo "duration_per_scheduler: ${DURATION_SECS}s, warmup: ${WARMUP_SECS}s" | tee -a "$LOG"
 echo "schedulers: $SCHEDULERS" | tee -a "$LOG"
 
 sum_softirq_line() {
@@ -125,6 +128,18 @@ run_case() {
   # Reset any previous scheduler started by agent.
   "$AGENT_BIN" unload-scheduler --config "$tmp_cfg" >/dev/null 2>&1 || true
 
+  local ok="true"
+  if ! "$AGENT_BIN" run --config "$tmp_cfg" --once >> "$LOG" 2>&1; then
+    ok="false"
+  fi
+
+  # Warmup window is excluded from metrics.
+  sleep "$WARMUP_SECS"
+
+  if ! "$AGENT_BIN" run --config "$tmp_cfg" --once >> "$LOG" 2>&1; then
+    ok="false"
+  fi
+
   local cpu_before total_before busy_before idle_before
   read -r total_before busy_before idle_before < <(read_cpu_stat)
   local rx_before tx_before ctxt_before
@@ -132,16 +147,7 @@ run_case() {
   tx_before="$(sum_softirq_line NET_TX)"
   ctxt_before="$(read_ctxt)"
 
-  local ok="true"
-  if ! "$AGENT_BIN" run --config "$tmp_cfg" --once >> "$LOG" 2>&1; then
-    ok="false"
-  fi
-
   sleep "$DURATION_SECS"
-
-  if ! "$AGENT_BIN" run --config "$tmp_cfg" --once >> "$LOG" 2>&1; then
-    ok="false"
-  fi
 
   local state
   state="$(cat /sys/kernel/sched_ext/state 2>/dev/null || echo unknown)"
