@@ -358,15 +358,15 @@ generate_markdown() {
     echo "# Multi-Interface Benchmark Report"
     echo
     echo "- Generated at: $(date -Is)"
-    echo "- Config: \\`$CONFIG_PATH\\`"
-    echo "- Interfaces: \\`$IFACES\\`"
-    echo "- Ping target: \\`${PING_TARGET:-disabled}\\`"
+    echo "- Config: \`$CONFIG_PATH\`"
+    echo "- Interfaces: \`$IFACES\`"
+    echo "- Ping target: \`${PING_TARGET:-disabled}\`"
     echo "- Duration per scheduler: ${DURATION_SECS}s (warmup ${WARMUP_SECS}s)"
     echo
     echo "## Summary"
     echo
-    echo "- Throughput-first winner: \\`${best_tx:-n/a}\\`"
-    echo "- Latency-first winner (p95): \\`${best_p95:-n/a}\\`"
+    echo "- Throughput-first winner: \`${best_tx:-n/a}\`"
+    echo "- Latency-first winner (p95): \`${best_p95:-n/a}\`"
     echo
     echo "## Results"
     echo

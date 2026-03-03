@@ -413,17 +413,17 @@ generate_markdown_report() {
     echo "# Full Benchmark Report"
     echo
     echo "- Generated at: $(date -Is)"
-    echo "- Config: \\`$CONFIG_PATH\\`"
-    echo "- Interface: \\`$IFACE\\`"
-    echo "- Ping target: \\`${PING_TARGET:-disabled}\\`"
+    echo "- Config: \`$CONFIG_PATH\`"
+    echo "- Interface: \`$IFACE\`"
+    echo "- Ping target: \`${PING_TARGET:-disabled}\`"
     echo "- Duration per scheduler: ${DURATION_SECS}s"
     echo
     echo "## Summary"
     echo
-    echo "- Best TX throughput: \\`${best_tx:-n/a}\\`"
-    echo "- Best p95 latency (raw): \\`${best_p95:-n/a}\\`"
-    echo "- Recommended (throughput-first): \\`${best_tx:-n/a}\\`"
-    echo "- Recommended (latency-first, with max<=1.5ms guard): \\`${best_latency_safe:-n/a}\\`"
+    echo "- Best TX throughput: \`${best_tx:-n/a}\`"
+    echo "- Best p95 latency (raw): \`${best_p95:-n/a}\`"
+    echo "- Recommended (throughput-first): \`${best_tx:-n/a}\`"
+    echo "- Recommended (latency-first, with max<=1.5ms guard): \`${best_latency_safe:-n/a}\`"
     echo
     echo "## Results"
     echo
