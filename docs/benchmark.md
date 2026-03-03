@@ -35,6 +35,8 @@ This mode also outputs:
 - latency metrics (`loss`, `avg`, `p95`, `max`) from ping samples
 - interface throughput estimate (`rx_mbps`, `tx_mbps`)
 - markdown report with quick winner summary
+  - throughput-first recommendation
+  - latency-first recommendation (guards against high max latency outliers)
 
 ## Output
 

@@ -160,7 +160,7 @@ fn default_scheduler_mode() -> SchedulerMode {
 }
 
 fn default_scheduler_start_command() -> Vec<String> {
-    Vec::new()
+    vec!["scx_cosmos".to_string()]
 }
 
 fn default_scheduler_pid_file() -> PathBuf {

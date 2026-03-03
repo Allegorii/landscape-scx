@@ -287,9 +287,25 @@ generate_markdown_report() {
   local csv="$1"
   local md="$2"
 
-  local best_tx best_p95
+  local best_tx best_p95 best_latency_safe
   best_tx="$(awk -F',' 'NR>1 && $2=="true" {if($6+0 > max){max=$6; name=$1}} END{print name}' "$csv")"
   best_p95="$(awk -F',' 'NR>1 && $2=="true" {if(min=="" || $12+0 < min){min=$12; name=$1}} END{print name}' "$csv")"
+  best_latency_safe="$(
+    awk -F',' '
+      NR==1 {next}
+      $2=="true" {
+        # Skip obviously unstable tail-latency outliers for latency-first recommendation.
+        if (($13+0) > 1.5) next;
+        if (best=="" || ($12+0) < best_p95 || (($12+0)==best_p95 && ($11+0) < best_avg)) {
+          best=$1; best_p95=$12+0; best_avg=$11+0;
+        }
+      }
+      END {print best}
+    ' "$csv"
+  )"
+  if [[ -z "$best_latency_safe" ]]; then
+    best_latency_safe="$best_p95"
+  fi
 
   {
     echo "# Full Benchmark Report"
@@ -303,7 +319,9 @@ generate_markdown_report() {
     echo "## Summary"
     echo
     echo "- Best TX throughput: \\`${best_tx:-n/a}\\`"
-    echo "- Best p95 latency: \\`${best_p95:-n/a}\\`"
+    echo "- Best p95 latency (raw): \\`${best_p95:-n/a}\\`"
+    echo "- Recommended (throughput-first): \\`${best_tx:-n/a}\\`"
+    echo "- Recommended (latency-first, with max<=1.5ms guard): \\`${best_latency_safe:-n/a}\\`"
     echo
     echo "## Results"
     echo

@@ -69,8 +69,8 @@ Resolution order is first-match wins. If no class matches, fallback is:
 
 `cargo run -p landscape-scx-agent -- validate --config ./configs/landscape-scx.toml`
 
-By default `scheduler.start_command = []`, and agent auto-detects a scheduler binary
-from PATH (`scx_bpfland`, `scx_lavd`, `scx_rustland`, ...). You can also set an explicit command.
+By default `scheduler.start_command = ["scx_cosmos"]`.
+You can set another explicit scheduler command if needed.
 
 ## Integration With Landscape
 
