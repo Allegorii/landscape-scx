@@ -1,0 +1,26 @@
+[discovery]
+process_names = ["landscape-webserver", "ksoftirqd"]
+cmdline_keywords = ["landscape-webserver"]
+# Optional: only match tasks in these cgroup path fragments.
+# cgroup_prefixes = ["/system.slice/landscape-webserver.service"]
+
+[policy]
+# Reserve forwarding cores for network-heavy threads.
+forwarding_cpus = [0, 1]
+# Reserve control-plane cores for management/UI/API work.
+control_cpus = [2, 3]
+manage_ksoftirqd = true
+apply_sched_ext = true
+
+[scheduler]
+mode = "external_command"
+# Use an external scheduler implementation first (e.g. from sched-ext/scx).
+start_command = ["scx_simple", "--partial"]
+# Optional explicit stop command. If empty, agent uses pid_file + SIGTERM.
+stop_command = []
+pid_file = "/run/landscape-scx/scheduler.pid"
+ready_timeout_ms = 3000
+fallback_on_error = true
+
+[agent]
+apply_interval_secs = 10

@@ -1,0 +1,10 @@
+[package]
+name = "landscape-scx-bpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+nix.workspace = true
+landscape-scx-common = { path = "../common" }

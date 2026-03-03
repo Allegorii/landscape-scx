@@ -1,0 +1,18 @@
+[Unit]
+Description=landscape sched_ext agent
+After=network-online.target landscape-router.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/landscape-scx-agent run --config /etc/landscape-scx/config.toml
+ExecStop=/usr/local/bin/landscape-scx-agent unload-scheduler --config /etc/landscape-scx/config.toml
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

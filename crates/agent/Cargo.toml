@@ -1,0 +1,13 @@
+[package]
+name = "landscape-scx-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+landscape-scx-common = { path = "../common" }
+landscape-scx-bpf = { path = "../scx-bpf" }

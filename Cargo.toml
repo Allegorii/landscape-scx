@@ -1,0 +1,24 @@
+[workspace]
+members = [
+  "crates/common",
+  "crates/scx-bpf",
+  "crates/agent",
+  "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["landscape-scx contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.53", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+nix = { version = "0.30.1", default-features = false, features = ["signal"] }
