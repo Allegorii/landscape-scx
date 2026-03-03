@@ -88,3 +88,15 @@ This installs:
 - `/usr/local/bin/landscape-scx`
 - `/etc/landscape-scx/config.toml`
 - `/etc/systemd/system/landscape-scx.service`
+
+## Prebuilt Profiles
+
+Common profile templates are available under:
+
+- `configs/profiles/conservative-any.toml`
+- `configs/profiles/balanced-4c.toml`
+- `configs/profiles/balanced-8c.toml`
+- `configs/profiles/low-latency-8c.toml`
+- `configs/profiles/throughput-16c.toml`
+
+See `configs/profiles/README.md` for selection guidance.

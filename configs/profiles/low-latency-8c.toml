@@ -1,0 +1,26 @@
+[discovery]
+process_names = ["landscape-webserver", "ksoftirqd"]
+cmdline_keywords = ["landscape-webserver"]
+
+[policy]
+# 8-core low-latency profile: give more cores to forwarding.
+forwarding_cpus = [0, 1, 2, 3]
+control_cpus = [4, 5, 6, 7]
+manage_ksoftirqd = true
+apply_sched_ext = true
+thread_cpu_classes = [
+  { thread_name_prefix = "tokio-runtime-w", cpus = [4, 5] },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [6] },
+  { thread_name_prefix = "r2d2-worker-", cpus = [7] },
+]
+
+[scheduler]
+mode = "external_command"
+start_command = []
+stop_command = []
+pid_file = "/run/landscape-scx/scheduler.pid"
+ready_timeout_ms = 3000
+fallback_on_error = true
+
+[agent]
+apply_interval_secs = 5

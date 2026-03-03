@@ -1,0 +1,22 @@
+[discovery]
+process_names = ["landscape-webserver", "ksoftirqd"]
+cmdline_keywords = ["landscape-webserver"]
+
+[policy]
+# Safest profile for unknown CPU topology.
+forwarding_cpus = [0]
+control_cpus = [0]
+manage_ksoftirqd = false
+apply_sched_ext = true
+thread_cpu_classes = []
+
+[scheduler]
+mode = "external_command"
+start_command = []
+stop_command = []
+pid_file = "/run/landscape-scx/scheduler.pid"
+ready_timeout_ms = 3000
+fallback_on_error = true
+
+[agent]
+apply_interval_secs = 10
