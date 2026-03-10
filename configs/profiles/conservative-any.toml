@@ -1,5 +1,5 @@
 [discovery]
-process_names = ["landscape-webserver", "ksoftirqd"]
+process_names = ["landscape-webserver"]
 cmdline_keywords = ["landscape-webserver"]
 
 [policy]

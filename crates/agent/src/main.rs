@@ -8,8 +8,9 @@ use landscape_scx_bpf::{
     ensure_scheduler, read_sched_ext_state, sched_ext_enabled, unload_scheduler,
 };
 use landscape_scx_common::{
-    discover_candidates, get_sched_policy, load_config, read_online_cpus, sched_policy_name,
-    try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config, ScxConfig,
+    discover_candidates, get_sched_policy, load_config, parse_ksoftirqd_cpu, read_online_cpus,
+    sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config, ScxConfig,
+    ThreadCpuClass,
 };
 use tracing::{error, info, warn};
 
@@ -180,87 +181,121 @@ fn health(config: PathBuf) -> Result<()> {
 
 fn apply_partial_switch(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     let self_pid = std::process::id() as i32;
-    let raw_list = discover_candidates(cfg)?;
-    let list: Vec<_> = raw_list
-        .into_iter()
-        .filter(|c| c.pid != self_pid)
-        .filter(|c| cfg.policy.manage_ksoftirqd || !c.comm.starts_with("ksoftirqd/"))
-        .collect();
+    let list: Vec<_> =
+        discover_candidates(cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
     info!("discovered {} candidate threads", list.len());
 
-    if dry_run || !cfg.policy.apply_sched_ext {
-        info!("dry-run mode, no sched_setattr syscall will be issued");
+    if dry_run {
+        info!("dry-run mode, no scheduler syscalls will be issued");
         for c in list {
-            let affinity_note =
-                if should_skip_affinity(&c.comm) { "affinity=skip" } else { "affinity=apply" };
+            let action = thread_policy_action(cfg, &c.comm);
             println!(
-                "[DRY] apply SCHED_EXT tid={} comm={} cpus={:?} {}",
+                "[DRY] tid={} comm={} cpus={:?} sched_ext={} affinity={}",
                 c.tid,
                 c.comm,
-                target_cpu_set(cfg, &c.comm),
-                affinity_note
+                action.cpus,
+                if action.apply_sched_ext { "apply" } else { "skip" },
+                if action.apply_affinity { "apply" } else { "skip" }
             );
         }
         return Ok(());
     }
 
-    let mut ok = 0usize;
-    let mut fail = 0usize;
+    let mut sched_ok = 0usize;
+    let mut sched_fail = 0usize;
+    let mut sched_skip = 0usize;
+    let mut affinity_ok = 0usize;
+    let mut affinity_fail = 0usize;
+    let mut affinity_skip = 0usize;
 
     for c in list {
-        let cpus = target_cpu_set(cfg, &c.comm);
-        if !should_skip_affinity(&c.comm) {
-            if let Err(e) = try_set_cpu_affinity(c.tid, &cpus) {
+        let action = thread_policy_action(cfg, &c.comm);
+
+        if action.apply_affinity {
+            if let Err(e) = try_set_cpu_affinity(c.tid, &action.cpus) {
+                affinity_fail += 1;
                 warn!("affinity failed tid={} comm={} err={}", c.tid, c.comm, e);
+            } else {
+                affinity_ok += 1;
             }
+        } else {
+            affinity_skip += 1;
         }
-        match try_set_sched_ext(c.tid) {
-            Ok(_) => {
-                ok += 1;
+
+        if action.apply_sched_ext {
+            match try_set_sched_ext(c.tid) {
+                Ok(_) => {
+                    sched_ok += 1;
+                }
+                Err(e) => {
+                    sched_fail += 1;
+                    warn!("failed tid={} comm={} err={}", c.tid, c.comm, e);
+                }
             }
-            Err(e) => {
-                fail += 1;
-                warn!("failed tid={} comm={} err={}", c.tid, c.comm, e);
-            }
+        } else {
+            sched_skip += 1;
         }
     }
 
-    info!("partial switch apply finished: success={} failed={}", ok, fail);
-    if fail > 0 {
+    info!(
+        "partial switch apply finished: sched_ext_success={} sched_ext_failed={} sched_ext_skipped={} affinity_success={} affinity_failed={} affinity_skipped={}",
+        sched_ok,
+        sched_fail,
+        sched_skip,
+        affinity_ok,
+        affinity_fail,
+        affinity_skip
+    );
+    if sched_fail > 0 || affinity_fail > 0 {
         warn!("some threads were not switched, verify root permission and sched_ext state");
     }
     Ok(())
 }
 
-fn target_cpu_set(cfg: &ScxConfig, comm: &str) -> Vec<usize> {
-    if let Some(cpus) = class_cpu_set(cfg, comm) {
-        return cpus;
+#[derive(Debug, Clone)]
+struct ThreadPolicyAction {
+    cpus: Vec<usize>,
+    apply_sched_ext: bool,
+    apply_affinity: bool,
+}
+
+fn thread_policy_action(cfg: &ScxConfig, comm: &str) -> ThreadPolicyAction {
+    let default = default_thread_policy_action(cfg, comm);
+    let Some(class) = matching_thread_class(cfg, comm) else {
+        return default;
+    };
+
+    ThreadPolicyAction {
+        cpus: if class.cpus.is_empty() { default.cpus } else { class.cpus.clone() },
+        apply_sched_ext: class.apply_sched_ext.unwrap_or(default.apply_sched_ext),
+        apply_affinity: class.apply_affinity.unwrap_or(default.apply_affinity),
+    }
+}
+
+fn default_thread_policy_action(cfg: &ScxConfig, comm: &str) -> ThreadPolicyAction {
+    ThreadPolicyAction {
+        cpus: default_cpu_set(cfg, comm),
+        apply_sched_ext: cfg.policy.apply_sched_ext,
+        apply_affinity: parse_ksoftirqd_cpu(comm).is_none(),
+    }
+}
+
+fn default_cpu_set(cfg: &ScxConfig, comm: &str) -> Vec<usize> {
+    if let Some(cpu) = parse_ksoftirqd_cpu(comm) {
+        return vec![cpu];
     }
 
-    if comm.starts_with("ksoftirqd/") {
-        if cfg.policy.forwarding_cpus.is_empty() {
-            return cfg.policy.control_cpus.clone();
-        }
-        return cfg.policy.forwarding_cpus.clone();
-    }
     if cfg.policy.control_cpus.is_empty() {
         return cfg.policy.forwarding_cpus.clone();
     }
+
     cfg.policy.control_cpus.clone()
 }
 
-fn class_cpu_set(cfg: &ScxConfig, comm: &str) -> Option<Vec<usize>> {
-    cfg.policy
-        .thread_cpu_classes
-        .iter()
-        .find(|class| {
-            !class.thread_name_prefix.is_empty() && comm.starts_with(&class.thread_name_prefix)
-        })
-        .and_then(|class| if class.cpus.is_empty() { None } else { Some(class.cpus.clone()) })
-}
-
-fn should_skip_affinity(comm: &str) -> bool {
-    comm.starts_with("ksoftirqd/")
+fn matching_thread_class<'a>(cfg: &'a ScxConfig, comm: &str) -> Option<&'a ThreadCpuClass> {
+    cfg.policy.thread_cpu_classes.iter().find(|class| {
+        !class.thread_name_prefix.is_empty() && comm.starts_with(&class.thread_name_prefix)
+    })
 }
 
 fn ensure_scheduler_with_fallback(cfg: &ScxConfig) -> Result<()> {
@@ -287,5 +322,36 @@ fn load_or_default(path: PathBuf) -> Result<ScxConfig> {
     } else {
         warn!("config file not found at {}, fallback to built-in defaults", path.display());
         Ok(ScxConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{thread_policy_action, ScxConfig, ThreadCpuClass};
+
+    #[test]
+    fn class_can_disable_sched_ext_without_disabling_affinity() {
+        let mut cfg = ScxConfig::default();
+        cfg.policy.thread_cpu_classes = vec![ThreadCpuClass {
+            thread_name_prefix: "tokio-runtime-w".into(),
+            cpus: vec![6, 7],
+            apply_sched_ext: Some(false),
+            apply_affinity: Some(true),
+        }];
+
+        let action = thread_policy_action(&cfg, "tokio-runtime-worker");
+        assert_eq!(action.cpus, vec![6, 7]);
+        assert!(action.apply_affinity);
+        assert!(!action.apply_sched_ext);
+    }
+
+    #[test]
+    fn ksoftirqd_defaults_to_its_own_cpu_and_no_affinity_change() {
+        let cfg = ScxConfig::default();
+        let action = thread_policy_action(&cfg, "ksoftirqd/3");
+
+        assert_eq!(action.cpus, vec![3]);
+        assert!(action.apply_sched_ext);
+        assert!(!action.apply_affinity);
     }
 }

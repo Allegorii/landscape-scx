@@ -44,20 +44,35 @@ cargo check
 
 ## Thread-Class CPU placement
 
-You can pin different thread groups to different CPU sets by prefix matching:
+You can pin different thread groups to different CPU sets by prefix matching,
+and override whether each class should apply `SCHED_EXT` or CPU affinity:
 
 ```toml
 [policy]
 thread_cpu_classes = [
-  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3] },
-  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [4] },
-  { thread_name_prefix = "r2d2-worker-", cpus = [5] },
+  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3], apply_sched_ext = true, apply_affinity = true },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [4], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "r2d2-worker-", cpus = [5], apply_sched_ext = false, apply_affinity = true },
 ]
 ```
 
-Resolution order is first-match wins. If no class matches, fallback is:
-- `ksoftirqd/*` -> `forwarding_cpus`
+Resolution order is first-match wins.
+
+- `cpus = []` means "inherit the default CPU set for this thread kind".
+- `apply_sched_ext` overrides `policy.apply_sched_ext` for that class only.
+- `apply_affinity` lets you keep a class on CFS while still pinning it, or skip pinning entirely.
+
+If no class matches, fallback is:
+- `ksoftirqd/N` -> CPU `N` (only for CPUs allowed by `policy.ksoftirqd_cpus` or `forwarding_cpus`)
 - others -> `control_cpus`
+
+You can also filter threads inside a matched process before any class policy is applied:
+
+```toml
+[discovery]
+thread_include_prefixes = ["tokio-runtime-w", "sqlx-sqlite-wor", "r2d2-worker-"]
+thread_exclude_prefixes = ["tokio-runtime-worker-blocking"]
+```
 
 ## Scheduler lifecycle
 
@@ -81,7 +96,7 @@ You can set another explicit scheduler command if needed.
 Default discovery targets:
 
 - `landscape-webserver`
-- `ksoftirqd/*`
+- `ksoftirqd/N` for CPUs selected by `policy.ksoftirqd_cpus` or `policy.forwarding_cpus`
 - optional command-line keyword matching for deployment-specific workers
 
 You can scope by cgroup path to avoid touching unrelated system tasks.
@@ -121,6 +136,8 @@ Common profile templates are available under:
 - `configs/profiles/balanced-4c.toml`
 - `configs/profiles/balanced-8c.toml`
 - `configs/profiles/low-latency-8c.toml`
+- `configs/profiles/landscape-forwarding-8c.toml`
+- `configs/profiles/landscape-forwarding-16c.toml`
 - `configs/profiles/throughput-16c.toml`
 
 See `configs/profiles/README.md` for selection guidance.

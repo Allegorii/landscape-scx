@@ -1,5 +1,5 @@
 [discovery]
-process_names = ["landscape-webserver", "ksoftirqd"]
+process_names = ["landscape-webserver"]
 cmdline_keywords = ["landscape-webserver"]
 
 [policy]
@@ -9,9 +9,9 @@ control_cpus = [2, 3]
 manage_ksoftirqd = true
 apply_sched_ext = true
 thread_cpu_classes = [
-  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3] },
-  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [2] },
-  { thread_name_prefix = "r2d2-worker-", cpus = [3] },
+  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3], apply_sched_ext = true, apply_affinity = true },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [2], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "r2d2-worker-", cpus = [3], apply_sched_ext = false, apply_affinity = true },
 ]
 
 [scheduler]

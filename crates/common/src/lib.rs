@@ -28,6 +28,10 @@ pub struct DiscoveryConfig {
     pub cmdline_keywords: Vec<String>,
     #[serde(default)]
     pub cgroup_prefixes: Vec<String>,
+    #[serde(default)]
+    pub thread_include_prefixes: Vec<String>,
+    #[serde(default)]
+    pub thread_exclude_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +42,8 @@ pub struct PolicyConfig {
     pub control_cpus: Vec<usize>,
     #[serde(default = "default_enable_ksoftirqd")]
     pub manage_ksoftirqd: bool,
+    #[serde(default)]
+    pub ksoftirqd_cpus: Vec<usize>,
     #[serde(default = "default_enable_sched_ext")]
     pub apply_sched_ext: bool,
     #[serde(default)]
@@ -47,7 +53,12 @@ pub struct PolicyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadCpuClass {
     pub thread_name_prefix: String,
+    #[serde(default)]
     pub cpus: Vec<usize>,
+    #[serde(default)]
+    pub apply_sched_ext: Option<bool>,
+    #[serde(default)]
+    pub apply_affinity: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +107,8 @@ impl Default for DiscoveryConfig {
             process_names: default_process_names(),
             cmdline_keywords: default_cmdline_keywords(),
             cgroup_prefixes: Vec::new(),
+            thread_include_prefixes: Vec::new(),
+            thread_exclude_prefixes: Vec::new(),
         }
     }
 }
@@ -106,6 +119,7 @@ impl Default for PolicyConfig {
             forwarding_cpus: default_forwarding_cpus(),
             control_cpus: default_control_cpus(),
             manage_ksoftirqd: default_enable_ksoftirqd(),
+            ksoftirqd_cpus: Vec::new(),
             apply_sched_ext: default_enable_sched_ext(),
             thread_cpu_classes: Vec::new(),
         }
@@ -237,7 +251,7 @@ pub fn discover_candidates(cfg: &ScxConfig) -> Result<Vec<ThreadCandidate>> {
                 Err(_) => continue,
             };
 
-            if !matches_target(&comm, &cmdline, &cgroup, &cfg.discovery) {
+            if !matches_target(&comm, &cmdline, &cgroup, cfg) {
                 continue;
             }
 
@@ -256,21 +270,59 @@ pub fn discover_candidates(cfg: &ScxConfig) -> Result<Vec<ThreadCandidate>> {
     Ok(out)
 }
 
-fn matches_target(comm: &str, cmdline: &str, cgroup: &str, cfg: &DiscoveryConfig) -> bool {
-    if comm.starts_with("ksoftirqd/") {
-        return true;
+fn matches_target(comm: &str, cmdline: &str, cgroup: &str, cfg: &ScxConfig) -> bool {
+    if let Some(cpu) = parse_ksoftirqd_cpu(comm) {
+        return matches_ksoftirqd(comm, cpu, cfg);
     }
 
-    let process_match = cfg.process_names.iter().any(|name| comm == name || comm.starts_with(name));
+    let process_match =
+        cfg.discovery.process_names.iter().any(|name| comm == name || comm.starts_with(name));
     let cmdline_match =
-        cfg.cmdline_keywords.iter().any(|kw| !kw.is_empty() && cmdline.contains(kw));
-    let cgroup_match = if cfg.cgroup_prefixes.is_empty() {
+        cfg.discovery.cmdline_keywords.iter().any(|kw| !kw.is_empty() && cmdline.contains(kw));
+    let cgroup_match = if cfg.discovery.cgroup_prefixes.is_empty() {
         true
     } else {
-        cfg.cgroup_prefixes.iter().any(|prefix| cgroup.contains(prefix))
+        cfg.discovery.cgroup_prefixes.iter().any(|prefix| cgroup.contains(prefix))
     };
 
-    (process_match || cmdline_match) && cgroup_match
+    (process_match || cmdline_match) && cgroup_match && matches_thread_filters(comm, &cfg.discovery)
+}
+
+fn matches_ksoftirqd(comm: &str, cpu: usize, cfg: &ScxConfig) -> bool {
+    if !cfg.policy.manage_ksoftirqd {
+        return false;
+    }
+
+    if !effective_ksoftirqd_cpus(&cfg.policy).contains(&cpu) {
+        return false;
+    }
+
+    matches_thread_filters(comm, &cfg.discovery)
+}
+
+fn matches_thread_filters(comm: &str, cfg: &DiscoveryConfig) -> bool {
+    let include_match = if cfg.thread_include_prefixes.is_empty() {
+        true
+    } else {
+        prefix_matches_any(comm, &cfg.thread_include_prefixes)
+    };
+    include_match && !prefix_matches_any(comm, &cfg.thread_exclude_prefixes)
+}
+
+fn prefix_matches_any(comm: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| !prefix.is_empty() && comm.starts_with(prefix))
+}
+
+fn effective_ksoftirqd_cpus(policy: &PolicyConfig) -> Vec<usize> {
+    if !policy.ksoftirqd_cpus.is_empty() {
+        return policy.ksoftirqd_cpus.clone();
+    }
+    policy.forwarding_cpus.clone()
+}
+
+pub fn parse_ksoftirqd_cpu(comm: &str) -> Option<usize> {
+    let suffix = comm.strip_prefix("ksoftirqd/")?;
+    suffix.parse().ok()
 }
 
 fn read_cmdline(pid: i32) -> io::Result<String> {
@@ -384,12 +436,21 @@ pub fn validate_cpu_config(cfg: &ScxConfig) -> Result<()> {
 
     validate_cpu_set("policy.forwarding_cpus", &cfg.policy.forwarding_cpus, &online)?;
     validate_cpu_set("policy.control_cpus", &cfg.policy.control_cpus, &online)?;
+    if !cfg.policy.ksoftirqd_cpus.is_empty() {
+        validate_optional_cpu_set("policy.ksoftirqd_cpus", &cfg.policy.ksoftirqd_cpus, &online)?;
+    }
 
     for (idx, class) in cfg.policy.thread_cpu_classes.iter().enumerate() {
         if class.thread_name_prefix.trim().is_empty() {
             anyhow::bail!("policy.thread_cpu_classes[{idx}].thread_name_prefix is empty");
         }
-        validate_cpu_set(&format!("policy.thread_cpu_classes[{idx}].cpus"), &class.cpus, &online)?;
+        if !class.cpus.is_empty() {
+            validate_optional_cpu_set(
+                &format!("policy.thread_cpu_classes[{idx}].cpus"),
+                &class.cpus,
+                &online,
+            )?;
+        }
     }
 
     Ok(())
@@ -399,6 +460,10 @@ fn validate_cpu_set(name: &str, cpus: &[usize], online: &BTreeSet<usize>) -> Res
     if cpus.is_empty() {
         anyhow::bail!("{name} is empty");
     }
+    validate_optional_cpu_set(name, cpus, online)
+}
+
+fn validate_optional_cpu_set(name: &str, cpus: &[usize], online: &BTreeSet<usize>) -> Result<()> {
     for cpu in cpus {
         if !online.contains(cpu) {
             anyhow::bail!(
@@ -435,4 +500,87 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
         anyhow::bail!("parsed online cpu list is empty from input: {raw}");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        matches_target, parse_ksoftirqd_cpu, DiscoveryConfig, PolicyConfig, SchedulerConfig,
+        SchedulerMode, ScxConfig,
+    };
+
+    fn test_config() -> ScxConfig {
+        ScxConfig {
+            discovery: DiscoveryConfig {
+                process_names: vec!["landscape-webserver".into()],
+                cmdline_keywords: vec!["landscape-webserver".into()],
+                cgroup_prefixes: Vec::new(),
+                thread_include_prefixes: Vec::new(),
+                thread_exclude_prefixes: Vec::new(),
+            },
+            policy: PolicyConfig {
+                forwarding_cpus: vec![0, 1],
+                control_cpus: vec![2, 3],
+                manage_ksoftirqd: true,
+                ksoftirqd_cpus: Vec::new(),
+                apply_sched_ext: true,
+                thread_cpu_classes: Vec::new(),
+            },
+            scheduler: SchedulerConfig {
+                mode: SchedulerMode::Disabled,
+                start_command: Vec::new(),
+                stop_command: Vec::new(),
+                pid_file: "/tmp/landscape-scx-test.pid".into(),
+                ready_timeout_ms: 1000,
+                fallback_on_error: false,
+            },
+            agent: super::AgentConfig { apply_interval_secs: 10 },
+        }
+    }
+
+    #[test]
+    fn parse_ksoftirqd_thread_name() {
+        assert_eq!(parse_ksoftirqd_cpu("ksoftirqd/0"), Some(0));
+        assert_eq!(parse_ksoftirqd_cpu("ksoftirqd/31"), Some(31));
+        assert_eq!(parse_ksoftirqd_cpu("ksoftirqd/not-a-cpu"), None);
+        assert_eq!(parse_ksoftirqd_cpu("tokio-runtime-w"), None);
+    }
+
+    #[test]
+    fn discovery_honors_thread_include_and_exclude_prefixes() {
+        let mut cfg = test_config();
+        cfg.discovery.thread_include_prefixes = vec!["tokio-runtime-w".into()];
+        cfg.discovery.thread_exclude_prefixes = vec!["tokio-runtime-worker-blocking".into()];
+
+        assert!(matches_target(
+            "tokio-runtime-w",
+            "landscape-webserver --config /etc/landscape.toml",
+            "",
+            &cfg
+        ));
+        assert!(!matches_target(
+            "axum-http-worker",
+            "landscape-webserver --config /etc/landscape.toml",
+            "",
+            &cfg
+        ));
+        assert!(!matches_target(
+            "tokio-runtime-worker-blocking",
+            "landscape-webserver --config /etc/landscape.toml",
+            "",
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn ksoftirqd_is_scoped_to_effective_cpu_set() {
+        let mut cfg = test_config();
+        assert!(matches_target("ksoftirqd/0", "", "", &cfg));
+        assert!(matches_target("ksoftirqd/1", "", "", &cfg));
+        assert!(!matches_target("ksoftirqd/2", "", "", &cfg));
+
+        cfg.policy.ksoftirqd_cpus = vec![3];
+        assert!(!matches_target("ksoftirqd/0", "", "", &cfg));
+        assert!(matches_target("ksoftirqd/3", "", "", &cfg));
+    }
 }

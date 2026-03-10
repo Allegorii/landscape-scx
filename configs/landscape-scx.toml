@@ -1,8 +1,13 @@
 [discovery]
-process_names = ["landscape-webserver", "ksoftirqd"]
+process_names = ["landscape-webserver"]
 cmdline_keywords = ["landscape-webserver"]
 # Optional: only match tasks in these cgroup path fragments.
 # cgroup_prefixes = ["/system.slice/landscape-webserver.service"]
+# Optional: after process/cmdline match, only keep threads with these name prefixes.
+# If empty, all threads in matched processes are considered.
+# thread_include_prefixes = ["tokio-runtime-w", "sqlx-sqlite-wor", "r2d2-worker-"]
+# Optional: exclude matched threads by name prefix after include filtering.
+# thread_exclude_prefixes = ["tokio-runtime-worker-blocking"]
 
 [policy]
 # Reserve forwarding cores for network-heavy threads.
@@ -10,13 +15,17 @@ forwarding_cpus = [0, 1]
 # Reserve control-plane cores for management/UI/API work.
 control_cpus = [2, 3]
 manage_ksoftirqd = true
+# Optional explicit ksoftirqd CPU allowlist. If empty, forwarding_cpus is used.
+# Only matching ksoftirqd/N threads are managed.
+# ksoftirqd_cpus = [0, 1]
 apply_sched_ext = true
-# Optional per-thread-name CPU classes (prefix match, first match wins).
-# Useful to separate runtime/database workers and reduce contention.
+# Optional per-thread-name policy classes (prefix match, first match wins).
+# cpus = [] means "inherit the default CPU set for this thread kind".
+# apply_sched_ext / apply_affinity override the default action for that class only.
 thread_cpu_classes = [
-  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3] },
-  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [4] },
-  { thread_name_prefix = "r2d2-worker-", cpus = [5] },
+  { thread_name_prefix = "tokio-runtime-w", cpus = [2, 3], apply_sched_ext = true, apply_affinity = true },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [4], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "r2d2-worker-", cpus = [5], apply_sched_ext = false, apply_affinity = true },
 ]
 
 [scheduler]
