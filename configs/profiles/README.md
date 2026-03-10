@@ -29,6 +29,10 @@ These templates are designed for common hardware layouts.
   - for 16-core `landscape-webserver` deployments
   - same strategy as above with wider forwarding and control domains
 
+- `archld-32c-dualwan.toml`
+  - host-tuned profile for the observed `archld` deployment with `ens27f0` and `ens16f1np1` as WAN
+  - forwarding CPUs are chosen from measured WAN IRQ hotspots, so re-check IRQ/XPS layout before reusing elsewhere
+
 - `throughput-16c.toml`
   - for 16-core hosts prioritizing forwarding throughput
   - wider forwarding domain with more isolated worker pools
@@ -48,6 +52,7 @@ These templates are designed for common hardware layouts.
 
 - If your `landscape` instance has extra named threads such as PPPoE or Wi-Fi helpers, treat the Landscape-specific profiles as a starting point, not a final answer
   - refine `thread_include_prefixes`, `thread_exclude_prefixes`, and `thread_cpu_classes` based on the actual thread list from `status` or `ps -eLo pid,tid,comm,cmd`
+  - host-tuned profiles like `archld-32c-dualwan.toml` should only be reused after checking WAN IRQ affinity, XPS/RPS masks, and service cgroup layout
 
 ## Usage
 

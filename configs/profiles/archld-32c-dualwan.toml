@@ -1,0 +1,42 @@
+[discovery]
+process_names = ["pppd"]
+cmdline_keywords = ["landscape-webserver"]
+cgroup_prefixes = ["/system.slice/landscape-router.service"]
+thread_include_prefixes = [
+  "ksoftirqd/",
+  "tokio-runtime-w",
+  "sqlx-sqlite-wor",
+  "r2d2-worker-",
+  "metric-db-threa",
+  "landscape-webse",
+  "pppd",
+]
+
+[policy]
+# Host-specific profile for the observed archld deployment:
+# - ens27f0 and ens16f1np1 are WAN uplinks
+# - forwarding CPUs come from their active IRQ hotspot set
+# - only ksoftirqd enters SCHED_EXT; user-space workers stay on CFS with affinity
+forwarding_cpus = [0, 2, 3, 6, 7, 8, 9, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30, 31]
+control_cpus = [1, 4, 5, 12, 13, 15, 17, 19, 20, 22, 25, 26, 27, 29]
+manage_ksoftirqd = true
+ksoftirqd_cpus = [0, 2, 3, 6, 7, 8, 9, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30, 31]
+apply_sched_ext = false
+thread_cpu_classes = [
+  { thread_name_prefix = "ksoftirqd/", cpus = [], apply_sched_ext = true, apply_affinity = false },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [25], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "r2d2-worker-", cpus = [26, 27], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "metric-db-threa", cpus = [29], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "pppd", cpus = [20], apply_sched_ext = false, apply_affinity = true },
+]
+
+[scheduler]
+mode = "external_command"
+start_command = ["scx_cosmos"]
+stop_command = []
+pid_file = "/run/landscape-scx/scheduler.pid"
+ready_timeout_ms = 3000
+fallback_on_error = true
+
+[agent]
+apply_interval_secs = 5

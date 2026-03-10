@@ -138,6 +138,7 @@ Common profile templates are available under:
 - `configs/profiles/low-latency-8c.toml`
 - `configs/profiles/landscape-forwarding-8c.toml`
 - `configs/profiles/landscape-forwarding-16c.toml`
+- `configs/profiles/archld-32c-dualwan.toml`
 - `configs/profiles/throughput-16c.toml`
 
 See `configs/profiles/README.md` for selection guidance.
