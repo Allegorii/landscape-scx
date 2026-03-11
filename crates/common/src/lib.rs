@@ -637,10 +637,14 @@ fn read_irq_locality_states(iface: &str) -> Result<Vec<IrqLocalityState>> {
             }
         };
 
+        let Some(queue_index) = parse_irq_queue_index(label) else {
+            continue;
+        };
+
         out.push(IrqLocalityState {
             irq,
             label: label.to_string(),
-            queue_index: parse_trailing_number(label),
+            queue_index: Some(queue_index),
             affinity_list_path,
             affinity_mask_path,
             affinity_list,
@@ -732,15 +736,18 @@ fn queue_index(name: &str, prefix: &str) -> Option<usize> {
     name.strip_prefix(prefix)?.parse().ok()
 }
 
-fn parse_trailing_number(raw: &str) -> Option<usize> {
-    let end = raw.len();
-    let start = raw
-        .char_indices()
-        .rev()
-        .take_while(|(_, ch)| ch.is_ascii_digit())
-        .last()
-        .map(|(idx, _)| idx)?;
-    raw[start..end].parse().ok()
+fn parse_irq_queue_index(label: &str) -> Option<usize> {
+    let (prefix, suffix) = label.rsplit_once('-')?;
+    if !prefix.contains("TxRx")
+        && !prefix.contains("txrx")
+        && !prefix.contains("-tx")
+        && !prefix.contains("-rx")
+        && !prefix.contains("_tx")
+        && !prefix.contains("_rx")
+    {
+        return None;
+    }
+    suffix.parse().ok()
 }
 
 pub fn cpu_mask_string(cpus: &[usize]) -> String {
@@ -970,8 +977,8 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
 mod tests {
     use super::{
         affinity_list_matches, cpu_list_string, cpu_mask_string, matches_target, parse_cpu_mask,
-        parse_ksoftirqd_cpu, xps_mask_matches, DiscoveryConfig, NetworkConfig, PolicyConfig,
-        QueueMappingMode, SchedulerConfig, SchedulerMode, ScxConfig,
+        parse_irq_queue_index, parse_ksoftirqd_cpu, xps_mask_matches, DiscoveryConfig,
+        NetworkConfig, PolicyConfig, QueueMappingMode, SchedulerConfig, SchedulerMode, ScxConfig,
     };
 
     fn test_config() -> ScxConfig {
@@ -1072,5 +1079,15 @@ mod tests {
         assert_eq!(parsed, vec![0, 2, 35]);
         assert!(xps_mask_matches(mask, &[0, 2, 35]));
         assert!(affinity_list_matches("0,2,35", &[0, 2, 35]));
+    }
+
+    #[test]
+    fn irq_queue_index_requires_queue_style_label() {
+        assert_eq!(parse_irq_queue_index("ens27f0-TxRx-0"), Some(0));
+        assert_eq!(parse_irq_queue_index("i40e-ens16f1np1-TxRx-31"), Some(31));
+        assert_eq!(parse_irq_queue_index("mlx5e-tx-7"), Some(7));
+        assert_eq!(parse_irq_queue_index("mlx5e-rx-9"), Some(9));
+        assert_eq!(parse_irq_queue_index("ens27f0"), None);
+        assert_eq!(parse_irq_queue_index("i40e-ens16f1np1"), None);
     }
 }
