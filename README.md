@@ -25,6 +25,7 @@ This initial version implements:
 - landscape-oriented thread discovery (process names + cmdline keywords)
 - scheduler lifecycle (`load/unload`) via external scx command
 - partial switch for matched threads (`SCHED_EXT` + CPU affinity)
+- optional interface-driven IRQ affinity + XPS placement
 - dry-run and status modes
 
 ## Build
@@ -73,6 +74,29 @@ You can also filter threads inside a matched process before any class policy is 
 thread_include_prefixes = ["tokio-runtime-w", "sqlx-sqlite-wor", "r2d2-worker-"]
 thread_exclude_prefixes = ["tokio-runtime-worker-blocking"]
 ```
+
+## Network locality
+
+You can also manage IRQ affinity and `xps_cpus` for selected interfaces using the
+same `policy.forwarding_cpus` set:
+
+```toml
+[network]
+interfaces = ["ens27f0", "ens16f1np1"]
+apply_irq_affinity = true
+apply_xps = true
+queue_mapping_mode = "round_robin"
+```
+
+Supported queue mapping modes:
+
+- `round_robin`: queue `N` maps to `forwarding_cpus[N % len]`
+- `full_mask`: every queue gets the full forwarding CPU mask
+
+`status` will print current IRQ/XPS values alongside expected values, and `validate`
+will fail if a managed interface or its queue/IRQ files are missing.
+
+For manual fallback outside the agent, use `./scripts/apply_network_locality.sh`.
 
 ## Scheduler lifecycle
 

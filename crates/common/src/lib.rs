@@ -15,6 +15,8 @@ pub struct ScxConfig {
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -62,6 +64,25 @@ pub struct ThreadCpuClass {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+    #[serde(default)]
+    pub apply_irq_affinity: bool,
+    #[serde(default)]
+    pub apply_xps: bool,
+    #[serde(default = "default_queue_mapping_mode")]
+    pub queue_mapping_mode: QueueMappingMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueMappingMode {
+    RoundRobin,
+    FullMask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulerMode {
     Disabled,
@@ -95,6 +116,7 @@ impl Default for ScxConfig {
         Self {
             discovery: DiscoveryConfig::default(),
             policy: PolicyConfig::default(),
+            network: NetworkConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
         }
@@ -145,6 +167,17 @@ impl Default for AgentConfig {
     }
 }
 
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            interfaces: Vec::new(),
+            apply_irq_affinity: false,
+            apply_xps: false,
+            queue_mapping_mode: default_queue_mapping_mode(),
+        }
+    }
+}
+
 fn default_process_names() -> Vec<String> {
     vec!["landscape-webserver".to_string()]
 }
@@ -191,6 +224,10 @@ const fn default_fallback_on_error() -> bool {
 
 const fn default_apply_interval_secs() -> u64 {
     10
+}
+
+fn default_queue_mapping_mode() -> QueueMappingMode {
+    QueueMappingMode::RoundRobin
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<ScxConfig> {
@@ -431,6 +468,388 @@ pub fn read_online_cpus() -> Result<BTreeSet<usize>> {
     parse_cpu_list(raw.trim())
 }
 
+#[derive(Debug, Clone)]
+pub struct InterfaceLocalityStatus {
+    pub interface: String,
+    pub tx_queues: Vec<QueueLocalityState>,
+    pub rx_queues: Vec<QueueLocalityState>,
+    pub irqs: Vec<IrqLocalityState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueLocalityState {
+    pub name: String,
+    pub path: PathBuf,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrqLocalityState {
+    pub irq: u32,
+    pub label: String,
+    pub queue_index: Option<usize>,
+    pub affinity_list_path: PathBuf,
+    pub affinity_mask_path: PathBuf,
+    pub affinity_list: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceLocalityPlan {
+    pub interface: String,
+    pub status: InterfaceLocalityStatus,
+    pub xps_actions: Vec<XpsAction>,
+    pub irq_actions: Vec<IrqAffinityAction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct XpsAction {
+    pub interface: String,
+    pub queue_name: String,
+    pub path: PathBuf,
+    pub cpus: Vec<usize>,
+    pub mask: String,
+    pub current_value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrqAffinityAction {
+    pub interface: String,
+    pub irq: u32,
+    pub label: String,
+    pub list_path: PathBuf,
+    pub mask_path: PathBuf,
+    pub cpus: Vec<usize>,
+    pub affinity_list: String,
+    pub current_affinity_list: String,
+}
+
+pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLocalityPlan>> {
+    let mut plans = Vec::new();
+
+    for iface in &cfg.network.interfaces {
+        let status = read_interface_locality_status(iface)?;
+        let xps_actions = if cfg.network.apply_xps {
+            build_interface_xps_actions(cfg, &status)?
+        } else {
+            Vec::new()
+        };
+        let irq_actions = if cfg.network.apply_irq_affinity {
+            build_interface_irq_actions(cfg, &status)?
+        } else {
+            Vec::new()
+        };
+
+        plans.push(InterfaceLocalityPlan {
+            interface: iface.clone(),
+            status,
+            xps_actions,
+            irq_actions,
+        });
+    }
+
+    Ok(plans)
+}
+
+fn read_interface_locality_status(iface: &str) -> Result<InterfaceLocalityStatus> {
+    let iface_root = PathBuf::from(format!("/sys/class/net/{iface}"));
+    if !iface_root.exists() {
+        anyhow::bail!(
+            "network.interfaces contains {iface}, but {} does not exist",
+            iface_root.display()
+        );
+    }
+
+    Ok(InterfaceLocalityStatus {
+        interface: iface.to_string(),
+        tx_queues: read_queue_locality_states(iface, "tx-", "xps_cpus")?,
+        rx_queues: read_queue_locality_states(iface, "rx-", "rps_cpus")?,
+        irqs: read_irq_locality_states(iface)?,
+    })
+}
+
+fn read_queue_locality_states(
+    iface: &str,
+    prefix: &str,
+    value_file: &str,
+) -> Result<Vec<QueueLocalityState>> {
+    let queue_root = PathBuf::from(format!("/sys/class/net/{iface}/queues"));
+    if !queue_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&queue_root)
+        .with_context(|| format!("failed to read queue dir for interface {iface}"))?
+    {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let path = entry.path().join(value_file);
+        if !path.exists() {
+            continue;
+        }
+        let value = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?
+            .trim()
+            .to_string();
+        out.push(QueueLocalityState { name, path, value });
+    }
+
+    out.sort_by_key(|queue| queue_index(&queue.name, prefix).unwrap_or(usize::MAX));
+    Ok(out)
+}
+
+fn read_irq_locality_states(iface: &str) -> Result<Vec<IrqLocalityState>> {
+    let raw = fs::read_to_string("/proc/interrupts").context("failed to read /proc/interrupts")?;
+    let mut out = Vec::new();
+
+    for line in raw.lines() {
+        let Some((irq_raw, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let label = rest.split_whitespace().last().unwrap_or_default();
+        if !label.contains(iface) {
+            continue;
+        }
+
+        let irq = match irq_raw.trim().parse::<u32>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let affinity_list_path = PathBuf::from(format!("/proc/irq/{irq}/smp_affinity_list"));
+        let affinity_mask_path = PathBuf::from(format!("/proc/irq/{irq}/smp_affinity"));
+        let affinity_list = match fs::read_to_string(&affinity_list_path) {
+            Ok(v) => v.trim().to_string(),
+            Err(_) => {
+                let mask = fs::read_to_string(&affinity_mask_path).with_context(|| {
+                    format!(
+                        "failed to read IRQ affinity for {iface} irq={irq} ({})",
+                        affinity_mask_path.display()
+                    )
+                })?;
+                let cpus = parse_cpu_mask(mask.trim())?.into_iter().collect::<Vec<_>>();
+                cpu_list_string(&cpus)
+            }
+        };
+
+        out.push(IrqLocalityState {
+            irq,
+            label: label.to_string(),
+            queue_index: parse_trailing_number(label),
+            affinity_list_path,
+            affinity_mask_path,
+            affinity_list,
+        });
+    }
+
+    out.sort_by_key(|irq| (irq.queue_index.unwrap_or(usize::MAX), irq.irq));
+    Ok(out)
+}
+
+fn build_interface_xps_actions(
+    cfg: &ScxConfig,
+    status: &InterfaceLocalityStatus,
+) -> Result<Vec<XpsAction>> {
+    if status.tx_queues.is_empty() {
+        anyhow::bail!(
+            "network.apply_xps is enabled, but interface {} has no tx-*/xps_cpus entries",
+            status.interface
+        );
+    }
+
+    let mut out = Vec::new();
+    for (ordinal, queue) in status.tx_queues.iter().enumerate() {
+        let index = queue_index(&queue.name, "tx-").unwrap_or(ordinal);
+        let cpus = desired_locality_cpus(
+            &cfg.policy.forwarding_cpus,
+            &cfg.network.queue_mapping_mode,
+            index,
+        );
+        out.push(XpsAction {
+            interface: status.interface.clone(),
+            queue_name: queue.name.clone(),
+            path: queue.path.clone(),
+            mask: cpu_mask_string(&cpus),
+            cpus,
+            current_value: queue.value.clone(),
+        });
+    }
+
+    Ok(out)
+}
+
+fn build_interface_irq_actions(
+    cfg: &ScxConfig,
+    status: &InterfaceLocalityStatus,
+) -> Result<Vec<IrqAffinityAction>> {
+    if status.irqs.is_empty() {
+        anyhow::bail!(
+            "network.apply_irq_affinity is enabled, but no IRQ labels containing interface {} were found in /proc/interrupts",
+            status.interface
+        );
+    }
+
+    let mut out = Vec::new();
+    for (ordinal, irq) in status.irqs.iter().enumerate() {
+        let index = irq.queue_index.unwrap_or(ordinal);
+        let cpus = desired_locality_cpus(
+            &cfg.policy.forwarding_cpus,
+            &cfg.network.queue_mapping_mode,
+            index,
+        );
+        out.push(IrqAffinityAction {
+            interface: status.interface.clone(),
+            irq: irq.irq,
+            label: irq.label.clone(),
+            list_path: irq.affinity_list_path.clone(),
+            mask_path: irq.affinity_mask_path.clone(),
+            affinity_list: cpu_list_string(&cpus),
+            cpus,
+            current_affinity_list: irq.affinity_list.clone(),
+        });
+    }
+
+    Ok(out)
+}
+
+fn desired_locality_cpus(
+    forwarding_cpus: &[usize],
+    mode: &QueueMappingMode,
+    index: usize,
+) -> Vec<usize> {
+    match mode {
+        QueueMappingMode::RoundRobin => vec![forwarding_cpus[index % forwarding_cpus.len()]],
+        QueueMappingMode::FullMask => forwarding_cpus.to_vec(),
+    }
+}
+
+fn queue_index(name: &str, prefix: &str) -> Option<usize> {
+    name.strip_prefix(prefix)?.parse().ok()
+}
+
+fn parse_trailing_number(raw: &str) -> Option<usize> {
+    let end = raw.len();
+    let start = raw
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(idx, _)| idx)?;
+    raw[start..end].parse().ok()
+}
+
+pub fn cpu_mask_string(cpus: &[usize]) -> String {
+    let unique = cpus.iter().copied().collect::<BTreeSet<_>>();
+    if unique.is_empty() {
+        return "0".to_string();
+    }
+
+    let groups = unique.iter().copied().max().unwrap_or(0) / 32 + 1;
+    let mut words = vec![0u32; groups];
+    for cpu in unique {
+        words[cpu / 32] |= 1u32 << (cpu % 32);
+    }
+
+    let mut parts = Vec::with_capacity(words.len());
+    for idx in (0..words.len()).rev() {
+        let word = words[idx];
+        if idx == words.len() - 1 {
+            parts.push(format!("{word:x}"));
+        } else {
+            parts.push(format!("{word:08x}"));
+        }
+    }
+    parts.join(",")
+}
+
+pub fn cpu_list_string(cpus: &[usize]) -> String {
+    let sorted = cpus.iter().copied().collect::<BTreeSet<_>>();
+    let values = sorted.into_iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        return String::new();
+    }
+
+    let mut out = Vec::new();
+    let mut start = values[0];
+    let mut prev = values[0];
+
+    for cpu in values.into_iter().skip(1) {
+        if cpu == prev + 1 {
+            prev = cpu;
+            continue;
+        }
+
+        out.push(format_cpu_range(start, prev));
+        start = cpu;
+        prev = cpu;
+    }
+    out.push(format_cpu_range(start, prev));
+
+    out.join(",")
+}
+
+fn format_cpu_range(start: usize, end: usize) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
+pub fn parse_cpu_mask(raw: &str) -> Result<BTreeSet<usize>> {
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!("cpu mask is empty");
+    }
+
+    let mut out = BTreeSet::new();
+    let parts = token.split(',').map(str::trim).collect::<Vec<_>>();
+    for (word_idx, part) in parts.iter().rev().enumerate() {
+        let value = u32::from_str_radix(part, 16)
+            .with_context(|| format!("invalid cpu mask word: {part}"))?;
+        for bit in 0..32 {
+            if (value & (1u32 << bit)) != 0 {
+                out.insert(word_idx * 32 + bit);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+pub fn xps_mask_matches(raw: &str, cpus: &[usize]) -> bool {
+    parse_cpu_mask(raw)
+        .map(|current| current == cpus.iter().copied().collect::<BTreeSet<_>>())
+        .unwrap_or(false)
+}
+
+pub fn affinity_list_matches(raw: &str, cpus: &[usize]) -> bool {
+    parse_cpu_list(raw.trim())
+        .map(|current| current == cpus.iter().copied().collect::<BTreeSet<_>>())
+        .unwrap_or(false)
+}
+
+pub fn write_xps_cpus(action: &XpsAction) -> Result<()> {
+    write_trimmed(&action.path, &action.mask)
+}
+
+pub fn write_irq_affinity(action: &IrqAffinityAction) -> Result<()> {
+    if action.list_path.exists() {
+        return write_trimmed(&action.list_path, &action.affinity_list);
+    }
+    write_trimmed(&action.mask_path, &cpu_mask_string(&action.cpus))
+}
+
+fn write_trimmed(path: &Path, value: &str) -> Result<()> {
+    fs::write(path, format!("{value}\n"))
+        .with_context(|| format!("failed to write {} -> {}", value, path.display()))
+}
+
 pub fn validate_cpu_config(cfg: &ScxConfig) -> Result<()> {
     let online = read_online_cpus()?;
 
@@ -453,6 +872,8 @@ pub fn validate_cpu_config(cfg: &ScxConfig) -> Result<()> {
         }
     }
 
+    validate_network_config(cfg)?;
+
     Ok(())
 }
 
@@ -473,6 +894,49 @@ fn validate_optional_cpu_set(name: &str, cpus: &[usize], online: &BTreeSet<usize
             );
         }
     }
+    Ok(())
+}
+
+fn validate_network_config(cfg: &ScxConfig) -> Result<()> {
+    let network = &cfg.network;
+    if !network.apply_irq_affinity && !network.apply_xps && network.interfaces.is_empty() {
+        return Ok(());
+    }
+
+    if network.interfaces.is_empty() {
+        anyhow::bail!(
+            "network.interfaces is empty, but network.apply_irq_affinity or network.apply_xps is enabled"
+        );
+    }
+
+    for iface in &network.interfaces {
+        let iface_root = PathBuf::from(format!("/sys/class/net/{iface}"));
+        if !iface_root.exists() {
+            anyhow::bail!(
+                "network.interfaces contains {iface}, but {} does not exist",
+                iface_root.display()
+            );
+        }
+
+        if network.apply_xps {
+            let tx_queues = read_queue_locality_states(iface, "tx-", "xps_cpus")?;
+            if tx_queues.is_empty() {
+                anyhow::bail!(
+                    "network.apply_xps is enabled, but interface {iface} has no tx-*/xps_cpus entries"
+                );
+            }
+        }
+
+        if network.apply_irq_affinity {
+            let irqs = read_irq_locality_states(iface)?;
+            if irqs.is_empty() {
+                anyhow::bail!(
+                    "network.apply_irq_affinity is enabled, but no IRQ labels containing interface {iface} were found in /proc/interrupts"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -505,8 +969,9 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        matches_target, parse_ksoftirqd_cpu, DiscoveryConfig, PolicyConfig, SchedulerConfig,
-        SchedulerMode, ScxConfig,
+        affinity_list_matches, cpu_list_string, cpu_mask_string, matches_target, parse_cpu_mask,
+        parse_ksoftirqd_cpu, xps_mask_matches, DiscoveryConfig, NetworkConfig, PolicyConfig,
+        QueueMappingMode, SchedulerConfig, SchedulerMode, ScxConfig,
     };
 
     fn test_config() -> ScxConfig {
@@ -525,6 +990,12 @@ mod tests {
                 ksoftirqd_cpus: Vec::new(),
                 apply_sched_ext: true,
                 thread_cpu_classes: Vec::new(),
+            },
+            network: NetworkConfig {
+                interfaces: Vec::new(),
+                apply_irq_affinity: false,
+                apply_xps: false,
+                queue_mapping_mode: QueueMappingMode::RoundRobin,
             },
             scheduler: SchedulerConfig {
                 mode: SchedulerMode::Disabled,
@@ -582,5 +1053,24 @@ mod tests {
         cfg.policy.ksoftirqd_cpus = vec![3];
         assert!(!matches_target("ksoftirqd/0", "", "", &cfg));
         assert!(matches_target("ksoftirqd/3", "", "", &cfg));
+    }
+
+    #[test]
+    fn cpu_list_string_compacts_ranges() {
+        assert_eq!(cpu_list_string(&[0, 2, 3, 4, 7, 8, 9]), "0,2-4,7-9");
+    }
+
+    #[test]
+    fn cpu_mask_string_formats_multiword_masks() {
+        assert_eq!(cpu_mask_string(&[0, 2, 35]), "8,00000005");
+    }
+
+    #[test]
+    fn parse_cpu_mask_round_trips() {
+        let mask = "8,00000005";
+        let parsed = parse_cpu_mask(mask).unwrap().into_iter().collect::<Vec<_>>();
+        assert_eq!(parsed, vec![0, 2, 35]);
+        assert!(xps_mask_matches(mask, &[0, 2, 35]));
+        assert!(affinity_list_matches("0,2,35", &[0, 2, 35]));
     }
 }

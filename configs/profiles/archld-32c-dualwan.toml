@@ -30,6 +30,12 @@ thread_cpu_classes = [
   { thread_name_prefix = "pppd", cpus = [20], apply_sched_ext = false, apply_affinity = true },
 ]
 
+[network]
+interfaces = ["ens27f0", "ens16f1np1"]
+apply_irq_affinity = true
+apply_xps = true
+queue_mapping_mode = "round_robin"
+
 [scheduler]
 mode = "external_command"
 start_command = ["scx_cosmos"]

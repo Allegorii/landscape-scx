@@ -8,9 +8,10 @@ use landscape_scx_bpf::{
     ensure_scheduler, read_sched_ext_state, sched_ext_enabled, unload_scheduler,
 };
 use landscape_scx_common::{
-    discover_candidates, get_sched_policy, load_config, parse_ksoftirqd_cpu, read_online_cpus,
-    sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config, ScxConfig,
-    ThreadCpuClass,
+    affinity_list_matches, build_network_locality_plans, discover_candidates, get_sched_policy,
+    load_config, parse_ksoftirqd_cpu, read_online_cpus, sched_policy_name, try_set_cpu_affinity,
+    try_set_sched_ext, validate_cpu_config, write_irq_affinity, write_xps_cpus, xps_mask_matches,
+    ScxConfig, ThreadCpuClass,
 };
 use tracing::{error, info, warn};
 
@@ -92,6 +93,7 @@ fn status(config: PathBuf) -> Result<()> {
             c.cmdline
         );
     }
+    print_network_status(&cfg)?;
     Ok(())
 }
 
@@ -122,11 +124,150 @@ fn run(config: PathBuf, dry_run: bool, once: bool) -> Result<()> {
     }
 
     loop {
+        apply_network_locality(&cfg, dry_run)?;
         apply_partial_switch(&cfg, dry_run)?;
         if once {
             break;
         }
         thread::sleep(Duration::from_secs(cfg.agent.apply_interval_secs));
+    }
+
+    Ok(())
+}
+
+fn print_network_status(cfg: &ScxConfig) -> Result<()> {
+    let plans = build_network_locality_plans(cfg)?;
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    println!("network_locality:");
+    for plan in plans {
+        println!(
+            "iface={} queue_mapping_mode={:?}",
+            plan.interface, cfg.network.queue_mapping_mode
+        );
+
+        for irq in &plan.status.irqs {
+            let expected = plan.irq_actions.iter().find(|action| action.irq == irq.irq);
+            if let Some(expected) = expected {
+                println!(
+                    "  irq={} label={} affinity={} expected={} status={}",
+                    irq.irq,
+                    irq.label,
+                    irq.affinity_list,
+                    expected.affinity_list,
+                    if affinity_list_matches(&irq.affinity_list, &expected.cpus) {
+                        "ok"
+                    } else {
+                        "mismatch"
+                    }
+                );
+            } else {
+                println!("  irq={} label={} affinity={}", irq.irq, irq.label, irq.affinity_list);
+            }
+        }
+
+        for queue in &plan.status.tx_queues {
+            let expected = plan.xps_actions.iter().find(|action| action.queue_name == queue.name);
+            if let Some(expected) = expected {
+                println!(
+                    "  tx_queue={} xps={} expected={} status={}",
+                    queue.name,
+                    queue.value,
+                    expected.mask,
+                    if xps_mask_matches(&queue.value, &expected.cpus) { "ok" } else { "mismatch" }
+                );
+            } else {
+                println!("  tx_queue={} xps={}", queue.name, queue.value);
+            }
+        }
+
+        for queue in &plan.status.rx_queues {
+            println!("  rx_queue={} rps={}", queue.name, queue.value);
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
+    let plans = build_network_locality_plans(cfg)?;
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        for plan in plans {
+            for action in &plan.irq_actions {
+                println!(
+                    "[DRY][NET] iface={} irq={} label={} affinity={} -> {}",
+                    action.interface,
+                    action.irq,
+                    action.label,
+                    action.current_affinity_list,
+                    action.affinity_list
+                );
+            }
+            for action in &plan.xps_actions {
+                println!(
+                    "[DRY][NET] iface={} tx_queue={} xps={} -> {}",
+                    action.interface, action.queue_name, action.current_value, action.mask
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let mut irq_ok = 0usize;
+    let mut irq_fail = 0usize;
+    let mut irq_skip = 0usize;
+    let mut xps_ok = 0usize;
+    let mut xps_fail = 0usize;
+    let mut xps_skip = 0usize;
+
+    for plan in plans {
+        for action in plan.irq_actions {
+            if affinity_list_matches(&action.current_affinity_list, &action.cpus) {
+                irq_skip += 1;
+                continue;
+            }
+
+            if let Err(e) = write_irq_affinity(&action) {
+                irq_fail += 1;
+                warn!(
+                    "irq affinity failed iface={} irq={} label={} err={}",
+                    action.interface, action.irq, action.label, e
+                );
+            } else {
+                irq_ok += 1;
+            }
+        }
+
+        for action in plan.xps_actions {
+            if xps_mask_matches(&action.current_value, &action.cpus) {
+                xps_skip += 1;
+                continue;
+            }
+
+            if let Err(e) = write_xps_cpus(&action) {
+                xps_fail += 1;
+                warn!(
+                    "xps update failed iface={} tx_queue={} err={}",
+                    action.interface, action.queue_name, e
+                );
+            } else {
+                xps_ok += 1;
+            }
+        }
+    }
+
+    info!(
+        "network locality apply finished: irq_success={} irq_failed={} irq_skipped={} xps_success={} xps_failed={} xps_skipped={}",
+        irq_ok, irq_fail, irq_skip, xps_ok, xps_fail, xps_skip
+    );
+    if irq_fail > 0 || xps_fail > 0 {
+        warn!("some IRQ/XPS locality updates failed, verify root permission and interface state");
     }
 
     Ok(())

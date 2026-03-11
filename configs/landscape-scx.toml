@@ -28,6 +28,18 @@ thread_cpu_classes = [
   { thread_name_prefix = "r2d2-worker-", cpus = [5], apply_sched_ext = false, apply_affinity = true },
 ]
 
+[network]
+# Optional NIC locality management for forwarding interfaces.
+# Managed interfaces must exist under /sys/class/net.
+# interfaces = ["ens27f0", "ens16f1np1"]
+# Apply IRQ affinity using policy.forwarding_cpus and queue_mapping_mode.
+apply_irq_affinity = false
+# Apply tx-*/xps_cpus using policy.forwarding_cpus and queue_mapping_mode.
+apply_xps = false
+# round_robin => queue N maps to forwarding_cpus[N % len]
+# full_mask   => every queue gets the full forwarding CPU mask
+queue_mapping_mode = "round_robin"
+
 [scheduler]
 mode = "external_command"
 # Default scheduler command.
