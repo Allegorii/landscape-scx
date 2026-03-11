@@ -100,7 +100,7 @@ pub fn unload_scheduler(cfg: &SchedulerConfig) -> Result<()> {
     match cfg.mode {
         SchedulerMode::Disabled => Ok(()),
         SchedulerMode::ExternalCommand => unload_external_scheduler(cfg),
-        SchedulerMode::CustomBpf => unload_custom_bpf_scheduler(),
+        SchedulerMode::CustomBpf => unload_custom_bpf_scheduler(cfg),
     }
 }
 
@@ -316,8 +316,18 @@ fn unload_external_scheduler(cfg: &SchedulerConfig) -> Result<()> {
     Ok(())
 }
 
-fn unload_custom_bpf_scheduler() -> Result<()> {
-    unload_custom_bpf_scheduler_by_name()
+fn unload_custom_bpf_scheduler(cfg: &SchedulerConfig) -> Result<()> {
+    let paths = builtin_paths(cfg);
+
+    unload_custom_bpf_scheduler_by_name()?;
+    cleanup_custom_bpf_link_dir(&paths.link_dir)?;
+    let _ = fs::remove_file(&paths.intent_state_path);
+
+    if !sched_ext_enabled() || read_sched_ext_ops() != "landscape_scx" {
+        return Ok(());
+    }
+
+    wait_for_landscape_scheduler_unloaded(cfg.ready_timeout_ms)
 }
 
 fn unload_custom_bpf_scheduler_by_name() -> Result<()> {
