@@ -75,6 +75,9 @@ switch_mode = "partial"
 # If empty, policy.control_cpus is used.
 housekeeping_cpus = []
 # Optional explicitly tagged forwarding workers that should be mapped to qids.
+# If their cmdline contains a managed interface name, they inherit that
+# interface's queue-0 owner CPU; otherwise a single-CPU thread class can pin
+# them to a specific qid owner.
 forwarding_thread_prefixes = []
 source_file = "./bpf/landscape_scx.bpf.c"
 build_dir = "/run/landscape-scx/custom-bpf"

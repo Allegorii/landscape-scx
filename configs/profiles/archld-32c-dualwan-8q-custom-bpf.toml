@@ -50,7 +50,7 @@ fallback_on_error = false
 [scheduler.custom_bpf]
 switch_mode = "partial"
 housekeeping_cpus = [1, 4, 5, 9, 12, 13, 15, 17, 19, 20, 22, 25, 26, 27, 29, 31]
-forwarding_thread_prefixes = []
+forwarding_thread_prefixes = ["pppd", "landscape_pppoe", "pppoe-rx-", "landscape-forwarder"]
 source_file = "./bpf/landscape_scx.bpf.c"
 build_dir = "/run/landscape-scx/archld-32c-dualwan-8q-custom-bpf"
 link_dir = "/sys/fs/bpf/landscape-scx-archld-32c-dualwan-8q"

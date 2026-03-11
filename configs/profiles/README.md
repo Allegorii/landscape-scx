@@ -40,6 +40,7 @@ These templates are designed for common hardware layouts.
 - `archld-32c-dualwan-8q-custom-bpf.toml`
   - built-in `custom_bpf` variant of the same `archld` 8-queue profile
   - intended for validating queue/task intent with real qids instead of the minimal local loader-only profile
+  - includes PPPoE / forwarding-worker prefixes so interface-local WAN workers can join the generated dataplane intent
 
 - `custom-bpf-local-test.toml`
   - minimal local validation profile for the built-in `custom_bpf` loader

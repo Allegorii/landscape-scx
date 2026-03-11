@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use landscape_scx_common::{
-    LandscapeSchedulerIntent, LandscapeTaskKind, ScxSwitchMode, SchedulerConfig, SchedulerMode,
+    LandscapeSchedulerIntent, LandscapeTaskKind, SchedulerConfig, SchedulerMode, ScxSwitchMode,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -42,16 +42,10 @@ pub fn validate_custom_bpf_runtime(cfg: &SchedulerConfig) -> Result<()> {
 
     let source_file = &cfg.custom_bpf.source_file;
     if !source_file.exists() {
-        anyhow::bail!(
-            "scheduler.custom_bpf.source_file does not exist: {}",
-            source_file.display()
-        );
+        anyhow::bail!("scheduler.custom_bpf.source_file does not exist: {}", source_file.display());
     }
     if !source_file.is_file() {
-        anyhow::bail!(
-            "scheduler.custom_bpf.source_file is not a file: {}",
-            source_file.display()
-        );
+        anyhow::bail!("scheduler.custom_bpf.source_file is not a file: {}", source_file.display());
     }
     if !Path::new("/sys/kernel/btf/vmlinux").exists() {
         anyhow::bail!("missing /sys/kernel/btf/vmlinux; kernel BTF is required for custom_bpf");
@@ -177,7 +171,8 @@ pub fn ensure_landscape_scheduler(
         .with_context(|| format!("failed to create {}", paths.link_dir.display()))?;
 
     let intent_state = toml::to_string(intent).context("failed to serialize scheduler intent")?;
-    let needs_reload = read_intent_state(&paths.intent_state_path).as_deref() != Some(intent_state.as_str())
+    let needs_reload = read_intent_state(&paths.intent_state_path).as_deref()
+        != Some(intent_state.as_str())
         || read_sched_ext_ops() != "landscape_scx"
         || !sched_ext_enabled();
 
@@ -331,14 +326,14 @@ fn unload_custom_bpf_scheduler_by_name() -> Result<()> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("No such file") || stderr.contains("not found") || stderr.contains("invalid name") {
+    if stderr.contains("No such file")
+        || stderr.contains("not found")
+        || stderr.contains("invalid name")
+    {
         return Ok(());
     }
 
-    anyhow::bail!(
-        "bpftool struct_ops unregister failed: {}",
-        stderr.trim()
-    )
+    anyhow::bail!("bpftool struct_ops unregister failed: {}", stderr.trim())
 }
 
 fn cleanup_custom_bpf_link_dir(link_dir: &Path) -> Result<()> {
@@ -348,8 +343,8 @@ fn cleanup_custom_bpf_link_dir(link_dir: &Path) -> Result<()> {
 
     // Best effort: if a previous pinned struct_ops link remains after the
     // scheduler has already exited, bpftool register will fail with EEXIST.
-    for entry in fs::read_dir(link_dir)
-        .with_context(|| format!("failed to read {}", link_dir.display()))?
+    for entry in
+        fs::read_dir(link_dir).with_context(|| format!("failed to read {}", link_dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -528,7 +523,9 @@ fn render_autogen_header(intent: &LandscapeSchedulerIntent) -> String {
     }
 
     if intent.tasks.is_empty() {
-        out.push_str("static const volatile struct landscape_boot_task_ctx landscape_gen_tasks[1] = {\n");
+        out.push_str(
+            "static const volatile struct landscape_boot_task_ctx landscape_gen_tasks[1] = {\n",
+        );
         out.push_str("    { .tid = 0, .qid = 0, .owner_cpu = 0, .flags = 0 },\n");
         out.push_str("};\n");
         return out;

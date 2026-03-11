@@ -170,7 +170,7 @@ mode = "custom_bpf"
 [scheduler.custom_bpf]
 switch_mode = "partial"
 housekeeping_cpus = [0, 1]
-forwarding_thread_prefixes = ["landscape-forwarder", "pppoe-rx-"]
+forwarding_thread_prefixes = ["pppd", "landscape-forwarder", "pppoe-rx-"]
 source_file = "./bpf/landscape_scx.bpf.c"
 build_dir = "/run/landscape-scx/custom-bpf"
 link_dir = "/run/landscape-scx/custom-bpf/links"
@@ -180,6 +180,9 @@ Current limitations:
 
 - the built-in scheduler is still an MVP and defaults to `switch_mode = "partial"`
 - only dataplane tasks present in the generated intent are switched into `SCHED_EXT`
+- forwarding workers first try to infer their target interface from `cmdline`
+  and map to that interface's queue-0 owner CPU; if no interface name is
+  present, the agent falls back to single-CPU thread class affinity
 - `load-scheduler` now preloads the built-in scheduler with the current
   generated intent, but it does not switch any tasks into `SCHED_EXT`
 - the runtime loader requires local `clang`, `bpftool`, kernel BTF, and root privileges
