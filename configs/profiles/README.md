@@ -33,6 +33,10 @@ These templates are designed for common hardware layouts.
   - host-tuned profile for the observed `archld` deployment with `ens27f0` and `ens16f1np1` as WAN
   - forwarding CPUs are chosen from measured WAN IRQ hotspots, so re-check IRQ/XPS layout before reusing elsewhere
 
+- `archld-32c-dualwan-8q.toml`
+  - host-tuned 8-queue-per-WAN variant for the same `archld` deployment
+  - assumes RSS / active queue usage is already reduced so queues `0-7` are the dataplane baseline
+
 - `throughput-16c.toml`
   - for 16-core hosts prioritizing forwarding throughput
   - wider forwarding domain with more isolated worker pools
@@ -53,6 +57,7 @@ These templates are designed for common hardware layouts.
 - If your `landscape` instance has extra named threads such as PPPoE or Wi-Fi helpers, treat the Landscape-specific profiles as a starting point, not a final answer
   - refine `thread_include_prefixes`, `thread_exclude_prefixes`, and `thread_cpu_classes` based on the actual thread list from `status` or `ps -eLo pid,tid,comm,cmd`
   - host-tuned profiles like `archld-32c-dualwan.toml` should only be reused after checking WAN IRQ affinity, XPS/RPS masks, and service cgroup layout
+  - queue-capped profiles like `archld-32c-dualwan-8q.toml` also require NIC queue/RSS tuning; `active_queue_count` alone does not reduce hardware queue fanout
 
 ## Usage
 

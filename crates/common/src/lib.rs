@@ -66,13 +66,37 @@ pub struct ThreadCpuClass {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default)]
-    pub interfaces: Vec<String>,
+    pub interfaces: Vec<NetworkInterfaceSpec>,
     #[serde(default)]
     pub apply_irq_affinity: bool,
     #[serde(default)]
     pub apply_xps: bool,
     #[serde(default = "default_queue_mapping_mode")]
     pub queue_mapping_mode: QueueMappingMode,
+    #[serde(default = "default_xps_mode")]
+    pub xps_mode: XpsMode,
+    #[serde(default)]
+    pub active_queue_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NetworkInterfaceSpec {
+    Name(String),
+    Config(NetworkInterfacePolicy),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInterfacePolicy {
+    pub name: String,
+    #[serde(default)]
+    pub forwarding_cpus: Vec<usize>,
+    #[serde(default)]
+    pub active_queue_count: usize,
+    #[serde(default)]
+    pub queue_mapping_mode: Option<QueueMappingMode>,
+    #[serde(default)]
+    pub xps_mode: Option<XpsMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +104,13 @@ pub struct NetworkConfig {
 pub enum QueueMappingMode {
     RoundRobin,
     FullMask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XpsMode {
+    Cpus,
+    Rxqs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +205,8 @@ impl Default for NetworkConfig {
             apply_irq_affinity: false,
             apply_xps: false,
             queue_mapping_mode: default_queue_mapping_mode(),
+            xps_mode: default_xps_mode(),
+            active_queue_count: 0,
         }
     }
 }
@@ -228,6 +261,10 @@ const fn default_apply_interval_secs() -> u64 {
 
 fn default_queue_mapping_mode() -> QueueMappingMode {
     QueueMappingMode::RoundRobin
+}
+
+fn default_xps_mode() -> XpsMode {
+    XpsMode::Cpus
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<ScxConfig> {
@@ -471,7 +508,8 @@ pub fn read_online_cpus() -> Result<BTreeSet<usize>> {
 #[derive(Debug, Clone)]
 pub struct InterfaceLocalityStatus {
     pub interface: String,
-    pub tx_queues: Vec<QueueLocalityState>,
+    pub tx_xps_cpus: Vec<QueueLocalityState>,
+    pub tx_xps_rxqs: Vec<QueueLocalityState>,
     pub rx_queues: Vec<QueueLocalityState>,
     pub irqs: Vec<IrqLocalityState>,
 }
@@ -496,6 +534,13 @@ pub struct IrqLocalityState {
 #[derive(Debug, Clone)]
 pub struct InterfaceLocalityPlan {
     pub interface: String,
+    pub forwarding_cpus: Vec<usize>,
+    pub queue_mapping_mode: QueueMappingMode,
+    pub xps_mode: XpsMode,
+    pub active_queue_count: usize,
+    pub total_tx_queues: usize,
+    pub total_rx_queues: usize,
+    pub total_irqs: usize,
     pub status: InterfaceLocalityStatus,
     pub xps_actions: Vec<XpsAction>,
     pub irq_actions: Vec<IrqAffinityAction>,
@@ -506,7 +551,8 @@ pub struct XpsAction {
     pub interface: String,
     pub queue_name: String,
     pub path: PathBuf,
-    pub cpus: Vec<usize>,
+    pub mode: XpsMode,
+    pub indices: Vec<usize>,
     pub mask: String,
     pub current_value: String,
 }
@@ -523,24 +569,77 @@ pub struct IrqAffinityAction {
     pub current_affinity_list: String,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedNetworkInterface {
+    name: String,
+    forwarding_cpus: Vec<usize>,
+    active_queue_count: usize,
+    queue_mapping_mode: QueueMappingMode,
+    xps_mode: XpsMode,
+}
+
+impl NetworkInterfaceSpec {
+    fn resolve(&self, network: &NetworkConfig, policy: &PolicyConfig) -> ResolvedNetworkInterface {
+        match self {
+            NetworkInterfaceSpec::Name(name) => ResolvedNetworkInterface {
+                name: name.clone(),
+                forwarding_cpus: policy.forwarding_cpus.clone(),
+                active_queue_count: network.active_queue_count,
+                queue_mapping_mode: network.queue_mapping_mode.clone(),
+                xps_mode: network.xps_mode.clone(),
+            },
+            NetworkInterfaceSpec::Config(cfg) => ResolvedNetworkInterface {
+                name: cfg.name.clone(),
+                forwarding_cpus: if cfg.forwarding_cpus.is_empty() {
+                    policy.forwarding_cpus.clone()
+                } else {
+                    cfg.forwarding_cpus.clone()
+                },
+                active_queue_count: if cfg.active_queue_count == 0 {
+                    network.active_queue_count
+                } else {
+                    cfg.active_queue_count
+                },
+                queue_mapping_mode: cfg
+                    .queue_mapping_mode
+                    .clone()
+                    .unwrap_or_else(|| network.queue_mapping_mode.clone()),
+                xps_mode: cfg.xps_mode.clone().unwrap_or_else(|| network.xps_mode.clone()),
+            },
+        }
+    }
+}
+
+fn resolved_network_interfaces(cfg: &ScxConfig) -> Vec<ResolvedNetworkInterface> {
+    cfg.network.interfaces.iter().map(|iface| iface.resolve(&cfg.network, &cfg.policy)).collect()
+}
+
 pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLocalityPlan>> {
     let mut plans = Vec::new();
 
-    for iface in &cfg.network.interfaces {
-        let status = read_interface_locality_status(iface)?;
+    for iface in resolved_network_interfaces(cfg) {
+        let status = read_interface_locality_status(&iface.name)?;
+        let active_queue_count = effective_active_queue_count(cfg, &iface, &status)?;
         let xps_actions = if cfg.network.apply_xps {
-            build_interface_xps_actions(cfg, &status)?
+            build_interface_xps_actions(&iface, &status, active_queue_count)?
         } else {
             Vec::new()
         };
         let irq_actions = if cfg.network.apply_irq_affinity {
-            build_interface_irq_actions(cfg, &status)?
+            build_interface_irq_actions(&iface, &status, active_queue_count)?
         } else {
             Vec::new()
         };
 
         plans.push(InterfaceLocalityPlan {
-            interface: iface.clone(),
+            interface: iface.name.clone(),
+            forwarding_cpus: iface.forwarding_cpus.clone(),
+            queue_mapping_mode: iface.queue_mapping_mode.clone(),
+            xps_mode: iface.xps_mode.clone(),
+            active_queue_count,
+            total_tx_queues: status_tx_queue_count(&status, &iface.xps_mode),
+            total_rx_queues: status.rx_queues.len(),
+            total_irqs: status.irqs.len(),
             status,
             xps_actions,
             irq_actions,
@@ -561,10 +660,68 @@ fn read_interface_locality_status(iface: &str) -> Result<InterfaceLocalityStatus
 
     Ok(InterfaceLocalityStatus {
         interface: iface.to_string(),
-        tx_queues: read_queue_locality_states(iface, "tx-", "xps_cpus")?,
+        tx_xps_cpus: read_queue_locality_states(iface, "tx-", "xps_cpus")?,
+        tx_xps_rxqs: read_queue_locality_states(iface, "tx-", "xps_rxqs")?,
         rx_queues: read_queue_locality_states(iface, "rx-", "rps_cpus")?,
         irqs: read_irq_locality_states(iface)?,
     })
+}
+
+fn effective_active_queue_count(
+    cfg: &ScxConfig,
+    iface: &ResolvedNetworkInterface,
+    status: &InterfaceLocalityStatus,
+) -> Result<usize> {
+    let mut capacities = Vec::new();
+
+    if cfg.network.apply_irq_affinity {
+        capacities.push(("irqs", status.irqs.len()));
+    }
+    if cfg.network.apply_xps {
+        capacities.push(("tx", status_tx_queue_count(status, &iface.xps_mode)));
+        if iface.xps_mode == XpsMode::Rxqs {
+            capacities.push(("rx", status.rx_queues.len()));
+        }
+    }
+    if capacities.is_empty() {
+        capacities.push(("tx", status_tx_queue_count(status, &iface.xps_mode)));
+    }
+
+    let available = capacities.iter().map(|(_, count)| *count).filter(|count| *count > 0).min();
+    let Some(available) = available else {
+        anyhow::bail!(
+            "interface {} has no active queue/IRQ data for the requested network locality mode",
+            iface.name
+        );
+    };
+
+    if iface.active_queue_count == 0 {
+        return Ok(available);
+    }
+
+    if iface.active_queue_count > available {
+        let summary = capacities
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "network interface {} requests active_queue_count={}, but only {} queues are usable ({})",
+            iface.name,
+            iface.active_queue_count,
+            available,
+            summary
+        );
+    }
+
+    Ok(iface.active_queue_count)
+}
+
+fn status_tx_queue_count(status: &InterfaceLocalityStatus, xps_mode: &XpsMode) -> usize {
+    match xps_mode {
+        XpsMode::Cpus => status.tx_xps_cpus.len(),
+        XpsMode::Rxqs => status.tx_xps_rxqs.len(),
+    }
 }
 
 fn read_queue_locality_states(
@@ -656,30 +813,39 @@ fn read_irq_locality_states(iface: &str) -> Result<Vec<IrqLocalityState>> {
 }
 
 fn build_interface_xps_actions(
-    cfg: &ScxConfig,
+    iface: &ResolvedNetworkInterface,
     status: &InterfaceLocalityStatus,
+    active_queue_count: usize,
 ) -> Result<Vec<XpsAction>> {
-    if status.tx_queues.is_empty() {
+    let queues = match iface.xps_mode {
+        XpsMode::Cpus => &status.tx_xps_cpus,
+        XpsMode::Rxqs => &status.tx_xps_rxqs,
+    };
+    if queues.is_empty() {
         anyhow::bail!(
-            "network.apply_xps is enabled, but interface {} has no tx-*/xps_cpus entries",
-            status.interface
+            "network.apply_xps is enabled, but interface {} has no tx-* entries for {:?}",
+            status.interface,
+            iface.xps_mode
         );
     }
 
     let mut out = Vec::new();
-    for (ordinal, queue) in status.tx_queues.iter().enumerate() {
-        let index = queue_index(&queue.name, "tx-").unwrap_or(ordinal);
-        let cpus = desired_locality_cpus(
-            &cfg.policy.forwarding_cpus,
-            &cfg.network.queue_mapping_mode,
-            index,
-        );
+    for (ordinal, queue) in queues.iter().take(active_queue_count).enumerate() {
+        let indices = match iface.xps_mode {
+            XpsMode::Cpus => {
+                desired_locality_cpus(&iface.forwarding_cpus, &iface.queue_mapping_mode, ordinal)
+            }
+            XpsMode::Rxqs => {
+                desired_locality_rxqs(active_queue_count, &iface.queue_mapping_mode, ordinal)
+            }
+        };
         out.push(XpsAction {
             interface: status.interface.clone(),
             queue_name: queue.name.clone(),
             path: queue.path.clone(),
-            mask: cpu_mask_string(&cpus),
-            cpus,
+            mode: iface.xps_mode.clone(),
+            mask: cpu_mask_string(&indices),
+            indices,
             current_value: queue.value.clone(),
         });
     }
@@ -688,8 +854,9 @@ fn build_interface_xps_actions(
 }
 
 fn build_interface_irq_actions(
-    cfg: &ScxConfig,
+    iface: &ResolvedNetworkInterface,
     status: &InterfaceLocalityStatus,
+    active_queue_count: usize,
 ) -> Result<Vec<IrqAffinityAction>> {
     if status.irqs.is_empty() {
         anyhow::bail!(
@@ -699,13 +866,9 @@ fn build_interface_irq_actions(
     }
 
     let mut out = Vec::new();
-    for (ordinal, irq) in status.irqs.iter().enumerate() {
-        let index = irq.queue_index.unwrap_or(ordinal);
-        let cpus = desired_locality_cpus(
-            &cfg.policy.forwarding_cpus,
-            &cfg.network.queue_mapping_mode,
-            index,
-        );
+    for (ordinal, irq) in status.irqs.iter().take(active_queue_count).enumerate() {
+        let cpus =
+            desired_locality_cpus(&iface.forwarding_cpus, &iface.queue_mapping_mode, ordinal);
         out.push(IrqAffinityAction {
             interface: status.interface.clone(),
             irq: irq.irq,
@@ -729,6 +892,17 @@ fn desired_locality_cpus(
     match mode {
         QueueMappingMode::RoundRobin => vec![forwarding_cpus[index % forwarding_cpus.len()]],
         QueueMappingMode::FullMask => forwarding_cpus.to_vec(),
+    }
+}
+
+fn desired_locality_rxqs(
+    active_queue_count: usize,
+    mode: &QueueMappingMode,
+    index: usize,
+) -> Vec<usize> {
+    match mode {
+        QueueMappingMode::RoundRobin => vec![index % active_queue_count],
+        QueueMappingMode::FullMask => (0..active_queue_count).collect(),
     }
 }
 
@@ -916,32 +1090,26 @@ fn validate_network_config(cfg: &ScxConfig) -> Result<()> {
         );
     }
 
-    for iface in &network.interfaces {
-        let iface_root = PathBuf::from(format!("/sys/class/net/{iface}"));
+    let online = read_online_cpus()?;
+
+    for iface in resolved_network_interfaces(cfg) {
+        validate_optional_cpu_set(
+            &format!("network.interfaces[{}].forwarding_cpus", iface.name),
+            &iface.forwarding_cpus,
+            &online,
+        )?;
+
+        let iface_root = PathBuf::from(format!("/sys/class/net/{}", iface.name));
         if !iface_root.exists() {
             anyhow::bail!(
-                "network.interfaces contains {iface}, but {} does not exist",
+                "network.interfaces contains {}, but {} does not exist",
+                iface.name,
                 iface_root.display()
             );
         }
 
-        if network.apply_xps {
-            let tx_queues = read_queue_locality_states(iface, "tx-", "xps_cpus")?;
-            if tx_queues.is_empty() {
-                anyhow::bail!(
-                    "network.apply_xps is enabled, but interface {iface} has no tx-*/xps_cpus entries"
-                );
-            }
-        }
-
-        if network.apply_irq_affinity {
-            let irqs = read_irq_locality_states(iface)?;
-            if irqs.is_empty() {
-                anyhow::bail!(
-                    "network.apply_irq_affinity is enabled, but no IRQ labels containing interface {iface} were found in /proc/interrupts"
-                );
-            }
-        }
+        let status = read_interface_locality_status(&iface.name)?;
+        let _ = effective_active_queue_count(cfg, &iface, &status)?;
     }
 
     Ok(())
@@ -977,8 +1145,9 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
 mod tests {
     use super::{
         affinity_list_matches, cpu_list_string, cpu_mask_string, matches_target, parse_cpu_mask,
-        parse_irq_queue_index, parse_ksoftirqd_cpu, xps_mask_matches, DiscoveryConfig,
-        NetworkConfig, PolicyConfig, QueueMappingMode, SchedulerConfig, SchedulerMode, ScxConfig,
+        parse_irq_queue_index, parse_ksoftirqd_cpu, resolved_network_interfaces, xps_mask_matches,
+        DiscoveryConfig, NetworkConfig, PolicyConfig, QueueMappingMode, SchedulerConfig,
+        SchedulerMode, ScxConfig, XpsMode,
     };
 
     fn test_config() -> ScxConfig {
@@ -1003,6 +1172,8 @@ mod tests {
                 apply_irq_affinity: false,
                 apply_xps: false,
                 queue_mapping_mode: QueueMappingMode::RoundRobin,
+                xps_mode: XpsMode::Cpus,
+                active_queue_count: 0,
             },
             scheduler: SchedulerConfig {
                 mode: SchedulerMode::Disabled,
@@ -1089,5 +1260,40 @@ mod tests {
         assert_eq!(parse_irq_queue_index("mlx5e-rx-9"), Some(9));
         assert_eq!(parse_irq_queue_index("ens27f0"), None);
         assert_eq!(parse_irq_queue_index("i40e-ens16f1np1"), None);
+    }
+
+    #[test]
+    fn network_interfaces_accept_string_and_table_forms() {
+        let cfg: ScxConfig = toml::from_str(
+            r#"
+[policy]
+forwarding_cpus = [0, 1, 2, 3]
+control_cpus = [4, 5]
+
+[network]
+apply_irq_affinity = true
+apply_xps = true
+active_queue_count = 8
+xps_mode = "cpus"
+queue_mapping_mode = "round_robin"
+interfaces = [
+  "eth0",
+  { name = "eth1", forwarding_cpus = [6, 7], active_queue_count = 4, xps_mode = "rxqs", queue_mapping_mode = "full_mask" }
+]
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolved_network_interfaces(&cfg);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "eth0");
+        assert_eq!(resolved[0].forwarding_cpus, vec![0, 1, 2, 3]);
+        assert_eq!(resolved[0].active_queue_count, 8);
+        assert_eq!(resolved[0].xps_mode, XpsMode::Cpus);
+        assert_eq!(resolved[1].name, "eth1");
+        assert_eq!(resolved[1].forwarding_cpus, vec![6, 7]);
+        assert_eq!(resolved[1].active_queue_count, 4);
+        assert_eq!(resolved[1].xps_mode, XpsMode::Rxqs);
+        assert_eq!(resolved[1].queue_mapping_mode, QueueMappingMode::FullMask);
     }
 }

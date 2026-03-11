@@ -77,8 +77,8 @@ thread_exclude_prefixes = ["tokio-runtime-worker-blocking"]
 
 ## Network locality
 
-You can also manage IRQ affinity and `xps_cpus` for selected interfaces using the
-same `policy.forwarding_cpus` set:
+You can also manage IRQ affinity and `xps_cpus` / `xps_rxqs` for selected
+interfaces. The simple string form reuses `policy.forwarding_cpus`:
 
 ```toml
 [network]
@@ -86,12 +86,36 @@ interfaces = ["ens27f0", "ens16f1np1"]
 apply_irq_affinity = true
 apply_xps = true
 queue_mapping_mode = "round_robin"
+xps_mode = "cpus"
+active_queue_count = 16
+```
+
+For per-interface CPU islands or queue-count caps, use table entries:
+
+```toml
+[network]
+apply_irq_affinity = true
+apply_xps = true
+interfaces = [
+  { name = "ens27f0", forwarding_cpus = [2, 3, 4, 5], active_queue_count = 4, xps_mode = "cpus" },
+  { name = "ens16f1np1", forwarding_cpus = [6, 7, 8, 9], active_queue_count = 4, xps_mode = "rxqs" },
+]
 ```
 
 Supported queue mapping modes:
 
 - `round_robin`: queue `N` maps to `forwarding_cpus[N % len]`
 - `full_mask`: every queue gets the full forwarding CPU mask
+
+Supported XPS modes:
+
+- `cpus`: manage `tx-*/xps_cpus`
+- `rxqs`: manage `tx-*/xps_rxqs` with queue-index bitmasks
+
+`active_queue_count = 0` means "manage all usable queues"; any positive value
+limits management to the first `N` queue IRQs / TX queues for that interface.
+This does not rewrite RSS indirection tables or NIC combined queue counts; it
+only limits what `landscape-scx` manages.
 
 `status` will print current IRQ/XPS values alongside expected values, and `validate`
 will fail if a managed interface or its queue/IRQ files are missing.
@@ -163,6 +187,7 @@ Common profile templates are available under:
 - `configs/profiles/landscape-forwarding-8c.toml`
 - `configs/profiles/landscape-forwarding-16c.toml`
 - `configs/profiles/archld-32c-dualwan.toml`
+- `configs/profiles/archld-32c-dualwan-8q.toml`
 - `configs/profiles/throughput-16c.toml`
 
 See `configs/profiles/README.md` for selection guidance.

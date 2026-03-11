@@ -144,43 +144,51 @@ fn print_network_status(cfg: &ScxConfig) -> Result<()> {
     println!("network_locality:");
     for plan in plans {
         println!(
-            "iface={} queue_mapping_mode={:?}",
-            plan.interface, cfg.network.queue_mapping_mode
+            "iface={} forwarding_cpus={} queue_mapping_mode={:?} xps_mode={:?} active_queues={}/{} irqs={}/{} rxqs={}/{}",
+            plan.interface,
+            landscape_scx_common::cpu_list_string(&plan.forwarding_cpus),
+            plan.queue_mapping_mode,
+            plan.xps_mode,
+            plan.active_queue_count,
+            plan.total_tx_queues,
+            plan.irq_actions.len(),
+            plan.total_irqs,
+            plan.active_queue_count.min(plan.total_rx_queues),
+            plan.total_rx_queues,
         );
 
-        for irq in &plan.status.irqs {
-            let expected = plan.irq_actions.iter().find(|action| action.irq == irq.irq);
-            if let Some(expected) = expected {
-                println!(
-                    "  irq={} label={} affinity={} expected={} status={}",
-                    irq.irq,
-                    irq.label,
-                    irq.affinity_list,
-                    expected.affinity_list,
-                    if affinity_list_matches(&irq.affinity_list, &expected.cpus) {
-                        "ok"
-                    } else {
-                        "mismatch"
-                    }
-                );
-            } else {
-                println!("  irq={} label={} affinity={}", irq.irq, irq.label, irq.affinity_list);
-            }
+        for action in &plan.irq_actions {
+            println!(
+                "  irq={} label={} affinity={} expected={} status={}",
+                action.irq,
+                action.label,
+                action.current_affinity_list,
+                action.affinity_list,
+                if affinity_list_matches(&action.current_affinity_list, &action.cpus) {
+                    "ok"
+                } else {
+                    "mismatch"
+                }
+            );
         }
 
-        for queue in &plan.status.tx_queues {
-            let expected = plan.xps_actions.iter().find(|action| action.queue_name == queue.name);
-            if let Some(expected) = expected {
-                println!(
-                    "  tx_queue={} xps={} expected={} status={}",
-                    queue.name,
-                    queue.value,
-                    expected.mask,
-                    if xps_mask_matches(&queue.value, &expected.cpus) { "ok" } else { "mismatch" }
-                );
-            } else {
-                println!("  tx_queue={} xps={}", queue.name, queue.value);
-            }
+        for action in &plan.xps_actions {
+            println!(
+                "  tx_queue={} {}={} expected={} status={}",
+                action.queue_name,
+                if matches!(action.mode, landscape_scx_common::XpsMode::Cpus) {
+                    "xps_cpus"
+                } else {
+                    "xps_rxqs"
+                },
+                action.current_value,
+                action.mask,
+                if xps_mask_matches(&action.current_value, &action.indices) {
+                    "ok"
+                } else {
+                    "mismatch"
+                }
+            );
         }
 
         for queue in &plan.status.rx_queues {
@@ -211,8 +219,16 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
             }
             for action in &plan.xps_actions {
                 println!(
-                    "[DRY][NET] iface={} tx_queue={} xps={} -> {}",
-                    action.interface, action.queue_name, action.current_value, action.mask
+                    "[DRY][NET] iface={} tx_queue={} {}={} -> {}",
+                    action.interface,
+                    action.queue_name,
+                    if matches!(action.mode, landscape_scx_common::XpsMode::Cpus) {
+                        "xps_cpus"
+                    } else {
+                        "xps_rxqs"
+                    },
+                    action.current_value,
+                    action.mask
                 );
             }
         }
@@ -245,7 +261,7 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
         }
 
         for action in plan.xps_actions {
-            if xps_mask_matches(&action.current_value, &action.cpus) {
+            if xps_mask_matches(&action.current_value, &action.indices) {
                 xps_skip += 1;
                 continue;
             }

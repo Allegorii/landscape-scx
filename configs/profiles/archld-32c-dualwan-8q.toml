@@ -13,14 +13,16 @@ thread_include_prefixes = [
 ]
 
 [policy]
-# Host-specific profile for the observed archld deployment:
-# - ens27f0 and ens16f1np1 are WAN uplinks
-# - forwarding CPUs come from their active IRQ hotspot set
-# - only ksoftirqd enters SCHED_EXT; user-space workers stay on CFS with affinity
-forwarding_cpus = [0, 2, 3, 6, 7, 8, 9, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30, 31]
-control_cpus = [1, 4, 5, 12, 13, 15, 17, 19, 20, 22, 25, 26, 27, 29]
+# Host-specific 8-queue-per-WAN profile for the observed archld deployment.
+# Use this only after reducing active queue usage / RSS so that ens27f0 and
+# ens16f1np1 primarily use queues 0-7.
+# - ens27f0 dataplane island: 0,2,3,6,7,8,10,14
+# - ens16f1np1 dataplane island: 11,16,18,21,23,24,28,30
+# - only ksoftirqd enters SCHED_EXT; user-space workers stay on CFS
+forwarding_cpus = [0, 2, 3, 6, 7, 8, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30]
+control_cpus = [1, 4, 5, 9, 12, 13, 15, 17, 19, 20, 22, 25, 26, 27, 29, 31]
 manage_ksoftirqd = true
-ksoftirqd_cpus = [0, 2, 3, 6, 7, 8, 9, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30, 31]
+ksoftirqd_cpus = [0, 2, 3, 6, 7, 8, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30]
 apply_sched_ext = false
 thread_cpu_classes = [
   { thread_name_prefix = "ksoftirqd/", cpus = [], apply_sched_ext = true, apply_affinity = false },
@@ -31,12 +33,14 @@ thread_cpu_classes = [
 ]
 
 [network]
-interfaces = ["ens27f0", "ens16f1np1"]
 apply_irq_affinity = true
 apply_xps = true
 queue_mapping_mode = "round_robin"
 xps_mode = "cpus"
-active_queue_count = 0
+interfaces = [
+  { name = "ens27f0", forwarding_cpus = [0, 2, 3, 6, 7, 8, 10, 14], active_queue_count = 8, xps_mode = "cpus" },
+  { name = "ens16f1np1", forwarding_cpus = [11, 16, 18, 21, 23, 24, 28, 30], active_queue_count = 8, xps_mode = "cpus" },
+]
 
 [scheduler]
 mode = "external_command"
