@@ -145,6 +145,31 @@ sum_softirq_line() {
   awk -v n="$name" '$1 ~ n":" {s=0; for(i=2;i<=NF;i++) s+=$i; print s; exit}' /proc/softirqs
 }
 
+read_sched_ext_state() {
+  cat /sys/kernel/sched_ext/state 2>/dev/null || echo unknown
+}
+
+read_sched_ext_ops() {
+  cat /sys/kernel/sched_ext/root/ops 2>/dev/null || echo unknown
+}
+
+config_scheduler_mode() {
+  local config_path="$1"
+  awk '
+    BEGIN { in_scheduler = 0; mode = "" }
+    /^\[scheduler\]/ { in_scheduler = 1; next }
+    /^\[/ && in_scheduler == 1 { in_scheduler = 0 }
+    in_scheduler == 1 && $1 == "mode" {
+      gsub(/"/, "", $3)
+      mode = $3
+    }
+    END {
+      if (mode == "") print "external_command"
+      else print mode
+    }
+  ' "$config_path"
+}
+
 read_cpu_stat() {
   awk '/^cpu / {total=0; for(i=2;i<=9;i++) total+=$i; busy=$2+$3+$4+$7+$8; print total, busy; exit}' /proc/stat
 }
@@ -255,15 +280,51 @@ extract_ping_stats() {
   echo "$loss $avg $p95 $max"
 }
 
+reset_sched_ext_state() {
+  "$AGENT_BIN" unload-scheduler --config "$CANDIDATE_CONFIG" >> "$LOG" 2>&1 || true
+  "$AGENT_BIN" unload-scheduler --config "$BASELINE_CONFIG" >> "$LOG" 2>&1 || true
+
+  local deadline=$((SECONDS + 10))
+  while [[ "$SECONDS" -lt "$deadline" ]]; do
+    if [[ "$(read_sched_ext_state)" != "enabled" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "[error] sched_ext still enabled after reset: ops=$(read_sched_ext_ops)" | tee -a "$LOG"
+  return 1
+}
+
 run_case() {
   local case_label="$1"
   local config_path="$2"
+  local scheduler_mode
+  scheduler_mode="$(config_scheduler_mode "$config_path")"
 
   echo "[case] $case_label" | tee -a "$LOG"
 
-  "$AGENT_BIN" unload-scheduler --config "$config_path" >> "$LOG" 2>&1 || true
+  if ! reset_sched_ext_state; then
+    echo "$case_label,$config_path,false,reset_failed,$(read_sched_ext_ops),0,0,0,0,0,0,100.00,0.00,0.00,0.00,,,," >> "$CSV"
+    return 0
+  fi
+
   if ! "$AGENT_BIN" run --config "$config_path" --once >> "$LOG" 2>&1; then
     echo "$case_label,$config_path,false,setup_failed,unknown,0,0,0,0,0,0,100.00,0.00,0.00,0.00,,,," >> "$CSV"
+    return 0
+  fi
+
+  local setup_state setup_ops
+  setup_state="$(read_sched_ext_state)"
+  setup_ops="$(read_sched_ext_ops)"
+  if [[ "$scheduler_mode" == "custom_bpf" && "$setup_ops" != "landscape_scx" ]]; then
+    echo "[error] $case_label expected landscape_scx, got ops=$setup_ops" | tee -a "$LOG"
+    echo "$case_label,$config_path,false,$setup_state,$setup_ops,0,0,0,0,0,0,100.00,0.00,0.00,0.00,,,," >> "$CSV"
+    return 0
+  fi
+  if [[ "$scheduler_mode" != "custom_bpf" && "$setup_ops" == "landscape_scx" ]]; then
+    echo "[error] $case_label expected external scheduler, but ops stayed landscape_scx" | tee -a "$LOG"
+    echo "$case_label,$config_path,false,$setup_state,$setup_ops,0,0,0,0,0,0,100.00,0.00,0.00,0.00,,,," >> "$CSV"
     return 0
   fi
 
