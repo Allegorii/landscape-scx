@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,12 @@ pub struct NetworkConfig {
     pub apply_irq_affinity: bool,
     #[serde(default)]
     pub apply_xps: bool,
+    #[serde(default)]
+    pub apply_rss_equal: bool,
+    #[serde(default)]
+    pub apply_combined_channels: bool,
+    #[serde(default)]
+    pub clear_inactive_xps: bool,
     #[serde(default = "default_queue_mapping_mode")]
     pub queue_mapping_mode: QueueMappingMode,
     #[serde(default = "default_xps_mode")]
@@ -93,6 +100,12 @@ pub struct NetworkInterfacePolicy {
     pub forwarding_cpus: Vec<usize>,
     #[serde(default)]
     pub active_queue_count: usize,
+    #[serde(default)]
+    pub apply_rss_equal: Option<bool>,
+    #[serde(default)]
+    pub apply_combined_channels: Option<bool>,
+    #[serde(default)]
+    pub clear_inactive_xps: Option<bool>,
     #[serde(default)]
     pub queue_mapping_mode: Option<QueueMappingMode>,
     #[serde(default)]
@@ -204,6 +217,9 @@ impl Default for NetworkConfig {
             interfaces: Vec::new(),
             apply_irq_affinity: false,
             apply_xps: false,
+            apply_rss_equal: false,
+            apply_combined_channels: false,
+            clear_inactive_xps: false,
             queue_mapping_mode: default_queue_mapping_mode(),
             xps_mode: default_xps_mode(),
             active_queue_count: 0,
@@ -512,6 +528,8 @@ pub struct InterfaceLocalityStatus {
     pub tx_xps_rxqs: Vec<QueueLocalityState>,
     pub rx_queues: Vec<QueueLocalityState>,
     pub irqs: Vec<IrqLocalityState>,
+    pub channel_status: Option<ChannelStatus>,
+    pub rss_status: Option<RssStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -537,12 +555,18 @@ pub struct InterfaceLocalityPlan {
     pub forwarding_cpus: Vec<usize>,
     pub queue_mapping_mode: QueueMappingMode,
     pub xps_mode: XpsMode,
+    pub apply_rss_equal: bool,
+    pub apply_combined_channels: bool,
+    pub clear_inactive_xps: bool,
     pub active_queue_count: usize,
     pub total_tx_queues: usize,
     pub total_rx_queues: usize,
     pub total_irqs: usize,
     pub status: InterfaceLocalityStatus,
+    pub channel_action: Option<ChannelAction>,
+    pub rss_action: Option<RssEqualAction>,
     pub xps_actions: Vec<XpsAction>,
+    pub inactive_xps_actions: Vec<XpsAction>,
     pub irq_actions: Vec<IrqAffinityAction>,
 }
 
@@ -574,8 +598,39 @@ struct ResolvedNetworkInterface {
     name: String,
     forwarding_cpus: Vec<usize>,
     active_queue_count: usize,
+    apply_rss_equal: bool,
+    apply_combined_channels: bool,
+    clear_inactive_xps: bool,
     queue_mapping_mode: QueueMappingMode,
     xps_mode: XpsMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelStatus {
+    pub current_combined: usize,
+    pub max_combined: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RssStatus {
+    pub ring_count: usize,
+    pub used_queues: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelAction {
+    pub interface: String,
+    pub current_combined: usize,
+    pub max_combined: usize,
+    pub expected_combined: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RssEqualAction {
+    pub interface: String,
+    pub current_ring_count: usize,
+    pub current_used_queues: Vec<usize>,
+    pub expected_queue_count: usize,
 }
 
 impl NetworkInterfaceSpec {
@@ -585,6 +640,9 @@ impl NetworkInterfaceSpec {
                 name: name.clone(),
                 forwarding_cpus: policy.forwarding_cpus.clone(),
                 active_queue_count: network.active_queue_count,
+                apply_rss_equal: network.apply_rss_equal,
+                apply_combined_channels: network.apply_combined_channels,
+                clear_inactive_xps: network.clear_inactive_xps,
                 queue_mapping_mode: network.queue_mapping_mode.clone(),
                 xps_mode: network.xps_mode.clone(),
             },
@@ -600,6 +658,11 @@ impl NetworkInterfaceSpec {
                 } else {
                     cfg.active_queue_count
                 },
+                apply_rss_equal: cfg.apply_rss_equal.unwrap_or(network.apply_rss_equal),
+                apply_combined_channels: cfg
+                    .apply_combined_channels
+                    .unwrap_or(network.apply_combined_channels),
+                clear_inactive_xps: cfg.clear_inactive_xps.unwrap_or(network.clear_inactive_xps),
                 queue_mapping_mode: cfg
                     .queue_mapping_mode
                     .clone()
@@ -618,10 +681,17 @@ pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLoca
     let mut plans = Vec::new();
 
     for iface in resolved_network_interfaces(cfg) {
-        let status = read_interface_locality_status(&iface.name)?;
+        let status = read_interface_locality_status(&iface)?;
         let active_queue_count = effective_active_queue_count(cfg, &iface, &status)?;
+        let channel_action = build_channel_action(&iface, &status, active_queue_count)?;
+        let rss_action = build_rss_equal_action(&iface, &status, active_queue_count)?;
         let xps_actions = if cfg.network.apply_xps {
             build_interface_xps_actions(&iface, &status, active_queue_count)?
+        } else {
+            Vec::new()
+        };
+        let inactive_xps_actions = if iface.clear_inactive_xps {
+            build_inactive_xps_actions(&status, active_queue_count)?
         } else {
             Vec::new()
         };
@@ -636,12 +706,18 @@ pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLoca
             forwarding_cpus: iface.forwarding_cpus.clone(),
             queue_mapping_mode: iface.queue_mapping_mode.clone(),
             xps_mode: iface.xps_mode.clone(),
+            apply_rss_equal: iface.apply_rss_equal,
+            apply_combined_channels: iface.apply_combined_channels,
+            clear_inactive_xps: iface.clear_inactive_xps,
             active_queue_count,
             total_tx_queues: status_tx_queue_count(&status, &iface.xps_mode),
             total_rx_queues: status.rx_queues.len(),
             total_irqs: status.irqs.len(),
+            channel_action,
+            rss_action,
             status,
             xps_actions,
+            inactive_xps_actions,
             irq_actions,
         });
     }
@@ -649,22 +725,195 @@ pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLoca
     Ok(plans)
 }
 
-fn read_interface_locality_status(iface: &str) -> Result<InterfaceLocalityStatus> {
-    let iface_root = PathBuf::from(format!("/sys/class/net/{iface}"));
+fn read_interface_locality_status(
+    iface: &ResolvedNetworkInterface,
+) -> Result<InterfaceLocalityStatus> {
+    let iface_root = PathBuf::from(format!("/sys/class/net/{}", iface.name));
     if !iface_root.exists() {
         anyhow::bail!(
-            "network.interfaces contains {iface}, but {} does not exist",
+            "network.interfaces contains {}, but {} does not exist",
+            iface.name,
             iface_root.display()
         );
     }
 
     Ok(InterfaceLocalityStatus {
-        interface: iface.to_string(),
-        tx_xps_cpus: read_queue_locality_states(iface, "tx-", "xps_cpus")?,
-        tx_xps_rxqs: read_queue_locality_states(iface, "tx-", "xps_rxqs")?,
-        rx_queues: read_queue_locality_states(iface, "rx-", "rps_cpus")?,
-        irqs: read_irq_locality_states(iface)?,
+        interface: iface.name.clone(),
+        tx_xps_cpus: read_queue_locality_states(&iface.name, "tx-", "xps_cpus")?,
+        tx_xps_rxqs: read_queue_locality_states(&iface.name, "tx-", "xps_rxqs")?,
+        rx_queues: read_queue_locality_states(&iface.name, "rx-", "rps_cpus")?,
+        irqs: read_irq_locality_states(&iface.name)?,
+        channel_status: if iface.apply_combined_channels {
+            Some(read_ethtool_channels_status(&iface.name)?)
+        } else {
+            None
+        },
+        rss_status: if iface.apply_rss_equal {
+            Some(read_ethtool_rss_status(&iface.name)?)
+        } else {
+            None
+        },
     })
+}
+
+fn run_ethtool(args: &[&str]) -> Result<String> {
+    let output = Command::new("ethtool")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute ethtool {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let details = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status)
+    };
+    anyhow::bail!("ethtool {} failed: {}", args.join(" "), details);
+}
+
+fn parse_ethtool_channels_status(raw: &str) -> Result<ChannelStatus> {
+    let mut max_combined = None;
+    let mut current_combined = None;
+    let mut in_preset = false;
+    let mut in_current = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        match trimmed {
+            "Pre-set maximums:" => {
+                in_preset = true;
+                in_current = false;
+                continue;
+            }
+            "Current hardware settings:" => {
+                in_preset = false;
+                in_current = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Combined:") {
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid ethtool combined value: {trimmed}"))?;
+            if in_preset {
+                max_combined = Some(parsed);
+            } else if in_current {
+                current_combined = Some(parsed);
+            }
+        }
+    }
+
+    let Some(current_combined) = current_combined else {
+        anyhow::bail!("failed to parse current combined channels from ethtool -l output");
+    };
+    let Some(max_combined) = max_combined else {
+        anyhow::bail!("failed to parse max combined channels from ethtool -l output");
+    };
+
+    Ok(ChannelStatus { current_combined, max_combined })
+}
+
+fn read_ethtool_channels_status(iface: &str) -> Result<ChannelStatus> {
+    parse_ethtool_channels_status(&run_ethtool(&["-l", iface])?)
+}
+
+fn parse_ethtool_rss_status(raw: &str) -> Result<RssStatus> {
+    let mut ring_count = None;
+    let mut used_queues = BTreeSet::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("RX flow hash indirection table") {
+            if let Some(start) = trimmed.find("with ") {
+                let rest = &trimmed[start + 5..];
+                if let Some(end) = rest.find(" RX ring(s)") {
+                    ring_count = Some(
+                        rest[..end]
+                            .trim()
+                            .parse::<usize>()
+                            .with_context(|| format!("invalid RSS ring count in: {trimmed}"))?,
+                    );
+                }
+            }
+            continue;
+        }
+
+        let Some((head, tail)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if !head.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        for token in tail.split_whitespace() {
+            if let Ok(queue) = token.parse::<usize>() {
+                used_queues.insert(queue);
+            }
+        }
+    }
+
+    let Some(ring_count) = ring_count else {
+        anyhow::bail!("failed to parse RSS ring count from ethtool -x output");
+    };
+
+    Ok(RssStatus {
+        ring_count,
+        used_queues: used_queues.into_iter().collect(),
+    })
+}
+
+fn read_ethtool_rss_status(iface: &str) -> Result<RssStatus> {
+    parse_ethtool_rss_status(&run_ethtool(&["-x", iface])?)
+}
+
+fn build_channel_action(
+    iface: &ResolvedNetworkInterface,
+    status: &InterfaceLocalityStatus,
+    active_queue_count: usize,
+) -> Result<Option<ChannelAction>> {
+    if !iface.apply_combined_channels {
+        return Ok(None);
+    }
+
+    let Some(channel_status) = &status.channel_status else {
+        anyhow::bail!("missing ethtool channel status for {}", iface.name);
+    };
+
+    Ok(Some(ChannelAction {
+        interface: iface.name.clone(),
+        current_combined: channel_status.current_combined,
+        max_combined: channel_status.max_combined,
+        expected_combined: active_queue_count,
+    }))
+}
+
+fn build_rss_equal_action(
+    iface: &ResolvedNetworkInterface,
+    status: &InterfaceLocalityStatus,
+    active_queue_count: usize,
+) -> Result<Option<RssEqualAction>> {
+    if !iface.apply_rss_equal {
+        return Ok(None);
+    }
+
+    let Some(rss_status) = &status.rss_status else {
+        anyhow::bail!("missing ethtool RSS status for {}", iface.name);
+    };
+
+    Ok(Some(RssEqualAction {
+        interface: iface.name.clone(),
+        current_ring_count: rss_status.ring_count,
+        current_used_queues: rss_status.used_queues.clone(),
+        expected_queue_count: active_queue_count,
+    }))
 }
 
 fn effective_active_queue_count(
@@ -853,6 +1102,40 @@ fn build_interface_xps_actions(
     Ok(out)
 }
 
+fn build_inactive_xps_actions(
+    status: &InterfaceLocalityStatus,
+    active_queue_count: usize,
+) -> Result<Vec<XpsAction>> {
+    let mut out = Vec::new();
+
+    for queue in status.tx_xps_cpus.iter().skip(active_queue_count) {
+        out.push(XpsAction {
+            interface: status.interface.clone(),
+            queue_name: queue.name.clone(),
+            path: queue.path.clone(),
+            mode: XpsMode::Cpus,
+            indices: Vec::new(),
+            mask: "0".to_string(),
+            current_value: queue.value.clone(),
+        });
+    }
+
+    for queue in status.tx_xps_rxqs.iter().skip(active_queue_count) {
+        out.push(XpsAction {
+            interface: status.interface.clone(),
+            queue_name: queue.name.clone(),
+            path: queue.path.clone(),
+            mode: XpsMode::Rxqs,
+            indices: Vec::new(),
+            mask: "0".to_string(),
+            current_value: queue.value.clone(),
+        });
+    }
+
+    out.sort_by(|a, b| a.queue_name.cmp(&b.queue_name).then_with(|| a.path.cmp(&b.path)));
+    Ok(out)
+}
+
 fn build_interface_irq_actions(
     iface: &ResolvedNetworkInterface,
     status: &InterfaceLocalityStatus,
@@ -1009,6 +1292,10 @@ pub fn xps_mask_matches(raw: &str, cpus: &[usize]) -> bool {
         .unwrap_or(false)
 }
 
+pub fn rss_equal_matches(current_used_queues: &[usize], expected_queue_count: usize) -> bool {
+    current_used_queues == (0..expected_queue_count).collect::<Vec<_>>().as_slice()
+}
+
 pub fn affinity_list_matches(raw: &str, cpus: &[usize]) -> bool {
     parse_cpu_list(raw.trim())
         .map(|current| current == cpus.iter().copied().collect::<BTreeSet<_>>())
@@ -1017,6 +1304,58 @@ pub fn affinity_list_matches(raw: &str, cpus: &[usize]) -> bool {
 
 pub fn write_xps_cpus(action: &XpsAction) -> Result<()> {
     write_trimmed(&action.path, &action.mask)
+}
+
+pub fn apply_ethtool_combined_channels(action: &ChannelAction) -> Result<()> {
+    let output = Command::new("ethtool")
+        .args(["-L", &action.interface, "combined", &action.expected_combined.to_string()])
+        .output()
+        .with_context(|| format!("failed to execute ethtool -L for {}", action.interface))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let details = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status)
+    };
+    anyhow::bail!(
+        "ethtool -L {} combined {} failed: {}",
+        action.interface,
+        action.expected_combined,
+        details
+    );
+}
+
+pub fn apply_ethtool_rss_equal(action: &RssEqualAction) -> Result<()> {
+    let output = Command::new("ethtool")
+        .args(["-X", &action.interface, "equal", &action.expected_queue_count.to_string()])
+        .output()
+        .with_context(|| format!("failed to execute ethtool -X for {}", action.interface))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let details = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status)
+    };
+    anyhow::bail!(
+        "ethtool -X {} equal {} failed: {}",
+        action.interface,
+        action.expected_queue_count,
+        details
+    );
 }
 
 pub fn write_irq_affinity(action: &IrqAffinityAction) -> Result<()> {
@@ -1108,7 +1447,7 @@ fn validate_network_config(cfg: &ScxConfig) -> Result<()> {
             );
         }
 
-        let status = read_interface_locality_status(&iface.name)?;
+        let status = read_interface_locality_status(&iface)?;
         let _ = effective_active_queue_count(cfg, &iface, &status)?;
     }
 
@@ -1145,7 +1484,8 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
 mod tests {
     use super::{
         affinity_list_matches, cpu_list_string, cpu_mask_string, matches_target, parse_cpu_mask,
-        parse_irq_queue_index, parse_ksoftirqd_cpu, resolved_network_interfaces, xps_mask_matches,
+        parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
+        parse_ksoftirqd_cpu, resolved_network_interfaces, rss_equal_matches, xps_mask_matches,
         DiscoveryConfig, NetworkConfig, PolicyConfig, QueueMappingMode, SchedulerConfig,
         SchedulerMode, ScxConfig, XpsMode,
     };
@@ -1171,6 +1511,9 @@ mod tests {
                 interfaces: Vec::new(),
                 apply_irq_affinity: false,
                 apply_xps: false,
+                apply_rss_equal: false,
+                apply_combined_channels: false,
+                clear_inactive_xps: false,
                 queue_mapping_mode: QueueMappingMode::RoundRobin,
                 xps_mode: XpsMode::Cpus,
                 active_queue_count: 0,
@@ -1273,12 +1616,15 @@ control_cpus = [4, 5]
 [network]
 apply_irq_affinity = true
 apply_xps = true
+apply_rss_equal = true
+apply_combined_channels = true
+clear_inactive_xps = true
 active_queue_count = 8
 xps_mode = "cpus"
 queue_mapping_mode = "round_robin"
 interfaces = [
   "eth0",
-  { name = "eth1", forwarding_cpus = [6, 7], active_queue_count = 4, xps_mode = "rxqs", queue_mapping_mode = "full_mask" }
+  { name = "eth1", forwarding_cpus = [6, 7], active_queue_count = 4, apply_rss_equal = false, clear_inactive_xps = false, xps_mode = "rxqs", queue_mapping_mode = "full_mask" }
 ]
 "#,
         )
@@ -1289,11 +1635,59 @@ interfaces = [
         assert_eq!(resolved[0].name, "eth0");
         assert_eq!(resolved[0].forwarding_cpus, vec![0, 1, 2, 3]);
         assert_eq!(resolved[0].active_queue_count, 8);
+        assert!(resolved[0].apply_rss_equal);
+        assert!(resolved[0].apply_combined_channels);
+        assert!(resolved[0].clear_inactive_xps);
         assert_eq!(resolved[0].xps_mode, XpsMode::Cpus);
         assert_eq!(resolved[1].name, "eth1");
         assert_eq!(resolved[1].forwarding_cpus, vec![6, 7]);
         assert_eq!(resolved[1].active_queue_count, 4);
+        assert!(!resolved[1].apply_rss_equal);
+        assert!(resolved[1].apply_combined_channels);
+        assert!(!resolved[1].clear_inactive_xps);
         assert_eq!(resolved[1].xps_mode, XpsMode::Rxqs);
         assert_eq!(resolved[1].queue_mapping_mode, QueueMappingMode::FullMask);
+    }
+
+    #[test]
+    fn parse_ethtool_channel_status() {
+        let status = parse_ethtool_channels_status(
+            r#"
+Channel parameters for ens27f0:
+Pre-set maximums:
+RX:             n/a
+TX:             n/a
+Other:          1
+Combined:       32
+Current hardware settings:
+RX:             n/a
+TX:             n/a
+Other:          1
+Combined:       8
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(status.max_combined, 32);
+        assert_eq!(status.current_combined, 8);
+    }
+
+    #[test]
+    fn parse_ethtool_rss_status_and_match_equal_range() {
+        let status = parse_ethtool_rss_status(
+            r#"
+RX flow hash indirection table for ens16f1np1 with 8 RX ring(s):
+    0:      0     1     2     3     4     5     6     7
+    8:      0     1     2     3     4     5     6     7
+RSS hash key:
+dead:beef
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(status.ring_count, 8);
+        assert_eq!(status.used_queues, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert!(rss_equal_matches(&status.used_queues, 8));
+        assert!(!rss_equal_matches(&status.used_queues, 4));
     }
 }

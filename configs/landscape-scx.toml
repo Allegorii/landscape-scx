@@ -33,15 +33,21 @@ thread_cpu_classes = [
 # Managed interfaces must exist under /sys/class/net.
 # String form uses policy.forwarding_cpus for all interfaces:
 # interfaces = ["ens27f0", "ens16f1np1"]
-# Table form allows per-interface CPU islands / queue counts / XPS mode:
+# Table form allows per-interface CPU islands / queue counts / XPS mode / ethtool policy:
 # interfaces = [
-#   { name = "ens27f0", forwarding_cpus = [0, 1, 2, 3], active_queue_count = 4, xps_mode = "cpus" },
+#   { name = "ens27f0", forwarding_cpus = [0, 1, 2, 3], active_queue_count = 4, apply_rss_equal = true, apply_combined_channels = true, clear_inactive_xps = true, xps_mode = "cpus" },
 #   { name = "ens16f1np1", forwarding_cpus = [4, 5, 6, 7], active_queue_count = 4, xps_mode = "rxqs" },
 # ]
 # Apply IRQ affinity using policy.forwarding_cpus and queue_mapping_mode.
 apply_irq_affinity = false
 # Apply tx-*/xps_cpus or tx-*/xps_rxqs depending on xps_mode.
 apply_xps = false
+# Optionally collapse RSS indirection to the first active_queue_count queues via `ethtool -X equal N`.
+apply_rss_equal = false
+# Optionally reduce NIC combined channels to active_queue_count via `ethtool -L combined N`.
+apply_combined_channels = false
+# Optionally zero inactive tx-*/xps_cpus and tx-*/xps_rxqs above active_queue_count.
+clear_inactive_xps = false
 # round_robin => queue N maps to forwarding_cpus[N % len]
 # full_mask   => every queue gets the full forwarding CPU mask
 queue_mapping_mode = "round_robin"

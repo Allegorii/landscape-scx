@@ -85,6 +85,9 @@ interfaces. The simple string form reuses `policy.forwarding_cpus`:
 interfaces = ["ens27f0", "ens16f1np1"]
 apply_irq_affinity = true
 apply_xps = true
+apply_rss_equal = true
+apply_combined_channels = true
+clear_inactive_xps = true
 queue_mapping_mode = "round_robin"
 xps_mode = "cpus"
 active_queue_count = 16
@@ -96,6 +99,9 @@ For per-interface CPU islands or queue-count caps, use table entries:
 [network]
 apply_irq_affinity = true
 apply_xps = true
+apply_rss_equal = true
+apply_combined_channels = true
+clear_inactive_xps = true
 interfaces = [
   { name = "ens27f0", forwarding_cpus = [2, 3, 4, 5], active_queue_count = 4, xps_mode = "cpus" },
   { name = "ens16f1np1", forwarding_cpus = [6, 7, 8, 9], active_queue_count = 4, xps_mode = "rxqs" },
@@ -114,13 +120,16 @@ Supported XPS modes:
 
 `active_queue_count = 0` means "manage all usable queues"; any positive value
 limits management to the first `N` queue IRQs / TX queues for that interface.
-This does not rewrite RSS indirection tables or NIC combined queue counts; it
-only limits what `landscape-scx` manages.
+When enabled, `apply_rss_equal = true` runs `ethtool -X <iface> equal <N>`,
+`apply_combined_channels = true` runs `ethtool -L <iface> combined <N>`, and
+`clear_inactive_xps = true` zeros any `tx-*` XPS files above the active queue
+limit so old full-queue mappings do not leak traffic back into higher queues.
 
 `status` will print current IRQ/XPS values alongside expected values, and `validate`
 will fail if a managed interface or its queue/IRQ files are missing.
 
 For manual fallback outside the agent, use `./scripts/apply_network_locality.sh`.
+That helper currently mirrors IRQ/XPS placement only; `ethtool -X/-L` and inactive XPS cleanup are handled by the agent.
 
 ## Scheduler lifecycle
 

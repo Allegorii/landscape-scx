@@ -35,6 +35,9 @@ thread_cpu_classes = [
 [network]
 apply_irq_affinity = true
 apply_xps = true
+apply_rss_equal = true
+apply_combined_channels = true
+clear_inactive_xps = true
 queue_mapping_mode = "round_robin"
 xps_mode = "cpus"
 interfaces = [

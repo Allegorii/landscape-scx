@@ -8,10 +8,11 @@ use landscape_scx_bpf::{
     ensure_scheduler, read_sched_ext_state, sched_ext_enabled, unload_scheduler,
 };
 use landscape_scx_common::{
-    affinity_list_matches, build_network_locality_plans, discover_candidates, get_sched_policy,
-    load_config, parse_ksoftirqd_cpu, read_online_cpus, sched_policy_name, try_set_cpu_affinity,
-    try_set_sched_ext, validate_cpu_config, write_irq_affinity, write_xps_cpus, xps_mask_matches,
-    ScxConfig, ThreadCpuClass,
+    affinity_list_matches, apply_ethtool_combined_channels, apply_ethtool_rss_equal,
+    build_network_locality_plans, discover_candidates, get_sched_policy, load_config,
+    parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches, sched_policy_name,
+    try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config, write_irq_affinity,
+    write_xps_cpus, xps_mask_matches, ScxConfig, ThreadCpuClass,
 };
 use tracing::{error, info, warn};
 
@@ -157,6 +158,45 @@ fn print_network_status(cfg: &ScxConfig) -> Result<()> {
             plan.total_rx_queues,
         );
 
+        if let Some(action) = &plan.channel_action {
+            println!(
+                "  combined_channels={} expected={} max={} status={}",
+                action.current_combined,
+                action.expected_combined,
+                action.max_combined,
+                if action.current_combined == action.expected_combined { "ok" } else { "mismatch" }
+            );
+        }
+
+        if let Some(action) = &plan.rss_action {
+            let expected = (0..action.expected_queue_count).collect::<Vec<_>>();
+            println!(
+                "  rss_equal ring_count={} queues={} expected={} status={}",
+                action.current_ring_count,
+                landscape_scx_common::cpu_list_string(&action.current_used_queues),
+                landscape_scx_common::cpu_list_string(&expected),
+                if rss_equal_matches(&action.current_used_queues, action.expected_queue_count) {
+                    "ok"
+                } else {
+                    "mismatch"
+                }
+            );
+        }
+
+        if !plan.inactive_xps_actions.is_empty() {
+            let zeroed = plan
+                .inactive_xps_actions
+                .iter()
+                .filter(|action| xps_mask_matches(&action.current_value, &action.indices))
+                .count();
+            println!(
+                "  inactive_xps_zeroed={}/{} status={}",
+                zeroed,
+                plan.inactive_xps_actions.len(),
+                if zeroed == plan.inactive_xps_actions.len() { "ok" } else { "mismatch" }
+            );
+        }
+
         for action in &plan.irq_actions {
             println!(
                 "  irq={} label={} affinity={} expected={} status={}",
@@ -207,6 +247,20 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
 
     if dry_run {
         for plan in plans {
+            if let Some(action) = &plan.channel_action {
+                println!(
+                    "[DRY][NET] iface={} combined_channels={} -> {}",
+                    action.interface, action.current_combined, action.expected_combined
+                );
+            }
+            if let Some(action) = &plan.rss_action {
+                println!(
+                    "[DRY][NET] iface={} rss_equal={} -> 0-{}",
+                    action.interface,
+                    landscape_scx_common::cpu_list_string(&action.current_used_queues),
+                    action.expected_queue_count.saturating_sub(1)
+                );
+            }
             for action in &plan.irq_actions {
                 println!(
                     "[DRY][NET] iface={} irq={} label={} affinity={} -> {}",
@@ -231,16 +285,74 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
                     action.mask
                 );
             }
+            for action in &plan.inactive_xps_actions {
+                println!(
+                    "[DRY][NET] iface={} inactive_tx_queue={} {}={} -> {}",
+                    action.interface,
+                    action.queue_name,
+                    if matches!(action.mode, landscape_scx_common::XpsMode::Cpus) {
+                        "xps_cpus"
+                    } else {
+                        "xps_rxqs"
+                    },
+                    action.current_value,
+                    action.mask
+                );
+            }
         }
         return Ok(());
     }
 
+    let mut channel_ok = 0usize;
+    let mut channel_fail = 0usize;
+    let mut channel_skip = 0usize;
+    let mut rss_ok = 0usize;
+    let mut rss_fail = 0usize;
+    let mut rss_skip = 0usize;
     let mut irq_ok = 0usize;
     let mut irq_fail = 0usize;
     let mut irq_skip = 0usize;
     let mut xps_ok = 0usize;
     let mut xps_fail = 0usize;
     let mut xps_skip = 0usize;
+    let mut inactive_xps_ok = 0usize;
+    let mut inactive_xps_fail = 0usize;
+    let mut inactive_xps_skip = 0usize;
+    let mut refresh_plans = false;
+
+    for plan in &plans {
+        if let Some(action) = &plan.channel_action {
+            if action.current_combined == action.expected_combined {
+                channel_skip += 1;
+            } else if let Err(e) = apply_ethtool_combined_channels(action) {
+                channel_fail += 1;
+                warn!(
+                    "combined queue update failed iface={} current={} target={} err={}",
+                    action.interface, action.current_combined, action.expected_combined, e
+                );
+            } else {
+                channel_ok += 1;
+                refresh_plans = true;
+            }
+        }
+
+        if let Some(action) = &plan.rss_action {
+            if rss_equal_matches(&action.current_used_queues, action.expected_queue_count) {
+                rss_skip += 1;
+            } else if let Err(e) = apply_ethtool_rss_equal(action) {
+                rss_fail += 1;
+                warn!(
+                    "rss equal update failed iface={} target={} err={}",
+                    action.interface, action.expected_queue_count, e
+                );
+            } else {
+                rss_ok += 1;
+                refresh_plans = true;
+            }
+        }
+    }
+
+    let plans = if refresh_plans { build_network_locality_plans(cfg)? } else { plans };
 
     for plan in plans {
         for action in plan.irq_actions {
@@ -276,14 +388,45 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
                 xps_ok += 1;
             }
         }
+
+        for action in plan.inactive_xps_actions {
+            if xps_mask_matches(&action.current_value, &action.indices) {
+                inactive_xps_skip += 1;
+                continue;
+            }
+
+            if let Err(e) = write_xps_cpus(&action) {
+                inactive_xps_fail += 1;
+                warn!(
+                    "inactive xps cleanup failed iface={} tx_queue={} err={}",
+                    action.interface, action.queue_name, e
+                );
+            } else {
+                inactive_xps_ok += 1;
+            }
+        }
     }
 
     info!(
-        "network locality apply finished: irq_success={} irq_failed={} irq_skipped={} xps_success={} xps_failed={} xps_skipped={}",
-        irq_ok, irq_fail, irq_skip, xps_ok, xps_fail, xps_skip
+        "network locality apply finished: channel_success={} channel_failed={} channel_skipped={} rss_success={} rss_failed={} rss_skipped={} irq_success={} irq_failed={} irq_skipped={} xps_success={} xps_failed={} xps_skipped={} inactive_xps_success={} inactive_xps_failed={} inactive_xps_skipped={}",
+        channel_ok,
+        channel_fail,
+        channel_skip,
+        rss_ok,
+        rss_fail,
+        rss_skip,
+        irq_ok,
+        irq_fail,
+        irq_skip,
+        xps_ok,
+        xps_fail,
+        xps_skip,
+        inactive_xps_ok,
+        inactive_xps_fail,
+        inactive_xps_skip
     );
-    if irq_fail > 0 || xps_fail > 0 {
-        warn!("some IRQ/XPS locality updates failed, verify root permission and interface state");
+    if channel_fail > 0 || rss_fail > 0 || irq_fail > 0 || xps_fail > 0 || inactive_xps_fail > 0 {
+        warn!("some network locality updates failed, verify root permission, ethtool support, and interface state");
     }
 
     Ok(())
