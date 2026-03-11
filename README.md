@@ -1,6 +1,6 @@
 # landscape-scx
 
-A standalone `sched_ext` project tailored for [landscape](../README.md) deployments.
+A standalone `sched_ext` project tailored for [landscape](https://github.com/ThisSeanZhang/landscape) deployments.
 
 ## Goals
 
