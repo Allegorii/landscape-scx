@@ -188,13 +188,17 @@ pub fn ensure_landscape_scheduler(
     let current_ops = read_sched_ext_ops();
     if current_ops == "landscape_scx" {
         unload_custom_bpf_scheduler_by_name()?;
+        cleanup_custom_bpf_link_dir(&paths.link_dir)?;
+        wait_for_landscape_scheduler_unloaded(cfg.ready_timeout_ms)?;
     } else if sched_ext_enabled() {
         anyhow::bail!(
             "sched_ext is already enabled by {}, unload it before loading landscape_scx",
             current_ops
         );
     }
-    cleanup_custom_bpf_link_dir(&paths.link_dir)?;
+    if current_ops != "landscape_scx" {
+        cleanup_custom_bpf_link_dir(&paths.link_dir)?;
+    }
 
     register_landscape_scheduler_object(&paths)?;
     wait_for_landscape_scheduler(cfg.ready_timeout_ms)?;
@@ -328,6 +332,7 @@ fn unload_custom_bpf_scheduler_by_name() -> Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("No such file")
         || stderr.contains("not found")
+        || stderr.contains("no struct_ops found")
         || stderr.contains("invalid name")
     {
         return Ok(());
@@ -381,6 +386,22 @@ fn wait_for_landscape_scheduler(timeout_ms: u64) -> Result<()> {
 
     anyhow::bail!(
         "landscape_scx did not become the active sched_ext ops within timeout (state={}, ops={})",
+        read_sched_ext_state(),
+        read_sched_ext_ops()
+    )
+}
+
+fn wait_for_landscape_scheduler_unloaded(timeout_ms: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if !sched_ext_enabled() || read_sched_ext_ops() != "landscape_scx" {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    anyhow::bail!(
+        "landscape_scx did not unload within timeout (state={}, ops={})",
         read_sched_ext_state(),
         read_sched_ext_ops()
     )
