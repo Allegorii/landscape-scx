@@ -318,8 +318,34 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     let mut inactive_xps_ok = 0usize;
     let mut inactive_xps_fail = 0usize;
     let mut inactive_xps_skip = 0usize;
-    let mut refresh_plans = false;
+    let mut plans = plans;
 
+    // Restore RSS indirection before reducing combined queue count; some drivers
+    // reject `ethtool -L combined N` while the indirection table still references
+    // queues outside the target range.
+    let mut refresh_after_rss = false;
+    for plan in &plans {
+        if let Some(action) = &plan.rss_action {
+            if rss_equal_matches(&action.current_used_queues, action.expected_queue_count) {
+                rss_skip += 1;
+            } else if let Err(e) = apply_ethtool_rss_equal(action) {
+                rss_fail += 1;
+                warn!(
+                    "rss equal update failed iface={} target={} err={}",
+                    action.interface, action.expected_queue_count, e
+                );
+            } else {
+                rss_ok += 1;
+                refresh_after_rss = true;
+            }
+        }
+    }
+
+    if refresh_after_rss {
+        plans = build_network_locality_plans(cfg)?;
+    }
+
+    let mut refresh_after_channels = false;
     for plan in &plans {
         if let Some(action) = &plan.channel_action {
             if action.current_combined == action.expected_combined {
@@ -332,27 +358,14 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
                 );
             } else {
                 channel_ok += 1;
-                refresh_plans = true;
-            }
-        }
-
-        if let Some(action) = &plan.rss_action {
-            if rss_equal_matches(&action.current_used_queues, action.expected_queue_count) {
-                rss_skip += 1;
-            } else if let Err(e) = apply_ethtool_rss_equal(action) {
-                rss_fail += 1;
-                warn!(
-                    "rss equal update failed iface={} target={} err={}",
-                    action.interface, action.expected_queue_count, e
-                );
-            } else {
-                rss_ok += 1;
-                refresh_plans = true;
+                refresh_after_channels = true;
             }
         }
     }
 
-    let plans = if refresh_plans { build_network_locality_plans(cfg)? } else { plans };
+    if refresh_after_channels {
+        plans = build_network_locality_plans(cfg)?;
+    }
 
     for plan in plans {
         for action in plan.irq_actions {
