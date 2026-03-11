@@ -7,7 +7,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use landscape_scx_bpf::{
     describe_landscape_scheduler_intent, ensure_scheduler, read_sched_ext_state,
-    sched_ext_enabled, unload_scheduler,
+    read_sched_ext_ops, sched_ext_enabled, unload_scheduler, ensure_landscape_scheduler,
+    validate_custom_bpf_runtime,
 };
 use landscape_scx_common::{
     affinity_list_matches, apply_ethtool_combined_channels, apply_ethtool_rss_equal,
@@ -79,9 +80,17 @@ fn main() -> Result<()> {
 
 fn status(config: PathBuf) -> Result<()> {
     let cfg = load_or_default(config)?;
-    let self_pid = std::process::id() as i32;
-    let list: Vec<_> =
-        discover_candidates(&cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
+    let prepared = if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
+        Some(prepare_builtin_scheduler_runtime(&cfg)?)
+    } else {
+        None
+    };
+    let list = if let Some(prepared) = &prepared {
+        prepared.candidates.clone()
+    } else {
+        let self_pid = std::process::id() as i32;
+        discover_candidates(&cfg)?.into_iter().filter(|c| c.pid != self_pid).collect()
+    };
     info!(
         "sched_ext state={} enabled={} matched_threads={}",
         read_sched_ext_state(),
@@ -99,15 +108,25 @@ fn status(config: PathBuf) -> Result<()> {
         );
     }
     print_network_status(&cfg)?;
-    if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
-        print_custom_scheduler_intent(&cfg, &list)?;
+    if let Some(prepared) = &prepared {
+        print!("{}", describe_landscape_scheduler_intent(&prepared.intent));
     }
     Ok(())
 }
 
 fn load_scheduler(config: PathBuf) -> Result<()> {
     let cfg = load_or_default(config)?;
-    ensure_scheduler_with_fallback(&cfg)
+    if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
+        let prepared = prepare_builtin_scheduler_runtime(&cfg)?;
+        info!(
+            "builtin scheduler load prepared: queues={} tasks={}",
+            prepared.intent.queues.len(),
+            prepared.intent.tasks.len()
+        );
+        ensure_landscape_scheduler_with_fallback(&cfg, &prepared.intent)
+    } else {
+        ensure_scheduler_with_fallback(&cfg)
+    }
 }
 
 fn unload_scheduler_cmd(config: PathBuf) -> Result<()> {
@@ -118,6 +137,7 @@ fn unload_scheduler_cmd(config: PathBuf) -> Result<()> {
 fn validate(config: PathBuf) -> Result<()> {
     let cfg = load_or_default(config)?;
     validate_cpu_config(&cfg)?;
+    validate_custom_bpf_runtime(&cfg.scheduler)?;
     let online = read_online_cpus()?;
     info!("config validation passed; online_cpus={:?}", online);
     Ok(())
@@ -127,13 +147,17 @@ fn run(config: PathBuf, dry_run: bool, once: bool) -> Result<()> {
     let cfg = load_or_default(config)?;
     validate_cpu_config(&cfg)?;
 
-    if !dry_run {
+    if !dry_run && !matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
         ensure_scheduler_with_fallback(&cfg)?;
     }
 
     loop {
         apply_network_locality(&cfg, dry_run)?;
-        apply_partial_switch(&cfg, dry_run)?;
+        if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
+            run_custom_bpf_cycle(&cfg, dry_run)?;
+        } else {
+            apply_partial_switch(&cfg, dry_run)?;
+        }
         if once {
             break;
         }
@@ -243,13 +267,6 @@ fn print_network_status(cfg: &ScxConfig) -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-fn print_custom_scheduler_intent(cfg: &ScxConfig, candidates: &[ThreadCandidate]) -> Result<()> {
-    let plans = build_network_locality_plans(cfg)?;
-    let intent = build_landscape_scheduler_intent(cfg, &plans, candidates);
-    print!("{}", describe_landscape_scheduler_intent(&intent));
     Ok(())
 }
 
@@ -510,6 +527,51 @@ fn apply_partial_switch(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     let self_pid = std::process::id() as i32;
     let list: Vec<_> =
         discover_candidates(cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
+
+    apply_partial_switch_to_candidates(cfg, &list, dry_run)
+}
+
+fn run_custom_bpf_cycle(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
+    let prepared = prepare_builtin_scheduler_runtime(cfg)?;
+
+    info!(
+        "builtin scheduler intent prepared: ops={} queues={} tasks={}",
+        read_sched_ext_ops(),
+        prepared.intent.queues.len(),
+        prepared.intent.tasks.len()
+    );
+    if dry_run {
+        print!("{}", describe_landscape_scheduler_intent(&prepared.intent));
+    } else {
+        ensure_landscape_scheduler_with_fallback(cfg, &prepared.intent)?;
+    }
+
+    apply_partial_switch_to_candidates(cfg, &prepared.selected, dry_run)
+}
+
+#[derive(Debug, Clone)]
+struct BuiltinSchedulerPrepared {
+    candidates: Vec<ThreadCandidate>,
+    intent: LandscapeSchedulerIntent,
+    selected: Vec<ThreadCandidate>,
+}
+
+fn prepare_builtin_scheduler_runtime(cfg: &ScxConfig) -> Result<BuiltinSchedulerPrepared> {
+    let self_pid = std::process::id() as i32;
+    let candidates: Vec<_> =
+        discover_candidates(cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
+    let plans = build_network_locality_plans(cfg)?;
+    let intent = build_landscape_scheduler_intent(cfg, &plans, &candidates);
+    let selected = select_builtin_scheduler_candidates(&intent, &candidates);
+
+    Ok(BuiltinSchedulerPrepared { candidates, intent, selected })
+}
+
+fn apply_partial_switch_to_candidates(
+    cfg: &ScxConfig,
+    list: &[ThreadCandidate],
+    dry_run: bool,
+) -> Result<()> {
     info!("discovered {} candidate threads", list.len());
 
     if dry_run {
@@ -727,6 +789,14 @@ fn matching_thread_class<'a>(cfg: &'a ScxConfig, comm: &str) -> Option<&'a Threa
     })
 }
 
+fn select_builtin_scheduler_candidates(
+    intent: &LandscapeSchedulerIntent,
+    candidates: &[ThreadCandidate],
+) -> Vec<ThreadCandidate> {
+    let tids = intent.tasks.iter().map(|task| task.tid).collect::<BTreeSet<_>>();
+    candidates.iter().filter(|c| tids.contains(&c.tid)).cloned().collect()
+}
+
 fn ensure_scheduler_with_fallback(cfg: &ScxConfig) -> Result<()> {
     match ensure_scheduler(&cfg.scheduler) {
         Ok(()) => {
@@ -739,6 +809,31 @@ fn ensure_scheduler_with_fallback(cfg: &ScxConfig) -> Result<()> {
                 Ok(())
             } else {
                 error!("scheduler ensure failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+}
+
+fn ensure_landscape_scheduler_with_fallback(
+    cfg: &ScxConfig,
+    intent: &LandscapeSchedulerIntent,
+) -> Result<()> {
+    match ensure_landscape_scheduler(&cfg.scheduler, intent) {
+        Ok(()) => {
+            info!(
+                "builtin scheduler ensure success, sched_ext state={} ops={}",
+                read_sched_ext_state(),
+                read_sched_ext_ops()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            if cfg.scheduler.fallback_on_error {
+                warn!("builtin scheduler ensure failed but fallback enabled: {}", e);
+                Ok(())
+            } else {
+                error!("builtin scheduler ensure failed: {}", e);
                 Err(e)
             }
         }

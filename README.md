@@ -26,7 +26,11 @@ This initial version implements:
 - scheduler lifecycle (`load/unload`) via external scx command
 - partial switch for matched threads (`SCHED_EXT` + CPU affinity)
 - optional interface-driven IRQ affinity + XPS placement
-- experimental `custom_bpf` scheduler intent generation and BPF hook skeleton
+- experimental built-in `custom_bpf` scheduler path:
+  - generates per-run queue/task intent
+  - renders an auto-generated scheduler header
+  - compiles `bpf/landscape_scx.bpf.c`
+  - registers `landscape_scx` through `bpftool struct_ops`
 - dry-run and status modes
 
 ## Build
@@ -142,6 +146,11 @@ That helper currently mirrors IRQ/XPS placement only; `ethtool -X/-L` and inacti
 
 `cargo run -p landscape-scx-agent -- validate --config ./configs/landscape-scx.toml`
 
+When `scheduler.mode = "custom_bpf"`, `validate` also checks the local build
+toolchain and compiles the scheduler source into a temporary object. That
+surfaces missing `clang`, missing `bpftool`, missing kernel BTF, or broken
+`source_file` paths before you try to `run`.
+
 ## Health check
 
 `cargo run -p landscape-scx-agent -- health --config ./configs/landscape-scx.toml`
@@ -152,7 +161,7 @@ You can set another explicit scheduler command if needed.
 ## Built-in scheduler skeleton
 
 You can also switch `scheduler.mode` to `custom_bpf` to inspect the generated
-queue/task intent that the future in-process SCX loader will consume:
+queue/task intent and drive the experimental built-in loader:
 
 ```toml
 [scheduler]
@@ -162,11 +171,23 @@ mode = "custom_bpf"
 switch_mode = "partial"
 housekeeping_cpus = [0, 1]
 forwarding_thread_prefixes = ["landscape-forwarder", "pppoe-rx-"]
+source_file = "./bpf/landscape_scx.bpf.c"
+build_dir = "/run/landscape-scx/custom-bpf"
+link_dir = "/run/landscape-scx/custom-bpf/links"
 ```
 
-Current limitation: the loader is not wired yet, so `custom_bpf` is for
-`status` / intent inspection and BPF skeleton development only. The operational
-path remains `mode = "external_command"`.
+Current limitations:
+
+- the built-in scheduler is still an MVP and defaults to `switch_mode = "partial"`
+- only dataplane tasks present in the generated intent are switched into `SCHED_EXT`
+- `load-scheduler` now preloads the built-in scheduler with the current
+  generated intent, but it does not switch any tasks into `SCHED_EXT`
+- the runtime loader requires local `clang`, `bpftool`, kernel BTF, and root privileges
+- `validate` checks compile-time prerequisites, but the actual `run` path still
+  needs root and `bpftool struct_ops` support from the running kernel
+
+The stable path remains `mode = "external_command"`. Use `custom_bpf` only when
+you explicitly want to iterate on the built-in queue-island scheduler.
 
 ## Integration With Landscape
 

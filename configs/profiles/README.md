@@ -37,6 +37,14 @@ These templates are designed for common hardware layouts.
   - host-tuned 8-queue-per-WAN variant for the same `archld` deployment
   - manages `ethtool -X/-L`, inactive XPS cleanup, and queue-locality so queues `0-7` become the dataplane baseline
 
+- `archld-32c-dualwan-8q-custom-bpf.toml`
+  - built-in `custom_bpf` variant of the same `archld` 8-queue profile
+  - intended for validating queue/task intent with real qids instead of the minimal local loader-only profile
+
+- `custom-bpf-local-test.toml`
+  - minimal local validation profile for the built-in `custom_bpf` loader
+  - does not manage NIC locality or switch any workload threads; it is only for verifying compile/register flow
+
 - `throughput-16c.toml`
   - for 16-core hosts prioritizing forwarding throughput
   - wider forwarding domain with more isolated worker pools

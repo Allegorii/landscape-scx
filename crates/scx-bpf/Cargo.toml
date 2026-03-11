@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 nix.workspace = true
+toml.workspace = true
 landscape-scx-common = { path = "../common" }

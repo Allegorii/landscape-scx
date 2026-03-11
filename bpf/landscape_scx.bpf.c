@@ -1,191 +1,132 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Minimal queue-island SCX skeleton for landscape.
+ * Minimal queue-island sched_ext scheduler for landscape.
  *
- * This file is intentionally not wired into the current cargo build yet. The
- * user-space side still launches external sched_ext schedulers by default, and
- * the future in-process loader will be responsible for:
+ * The generated header landscape_scx.autogen.h is emitted by user space from
+ * the current queue/task intent. The first runnable version intentionally keeps
+ * the dataplane set small and relies on partial switch:
  *
- * - loading this struct_ops program
- * - creating qid_to_cpu / cpu_to_qid / task_to_qid contents
- * - toggling SCX_OPS_SWITCH_PARTIAL vs full switch
- *
- * First intended rollout:
- * - single NIC or small fixed queue set
- * - one DSQ per queue-id
- * - ksoftirqd/<cpu> and explicitly tagged forwarding workers only
- * - partial switch first, full switch later
+ * - qid -> owner_cpu comes from generated queue owner arrays
+ * - tid -> qid/owner_cpu comes from generated dataplane task table
+ * - all non-dataplane tasks fall back to SCX_DSQ_GLOBAL
  */
 
 #include "vmlinux.h"
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-/*
- * The exact scx helper/header wiring depends on the kernel/libbpf environment
- * used by the future loader. Keep this file as a source-of-truth skeleton for
- * the hook layout and map contract even before the build glue lands.
- */
-
-#define LANDSCAPE_DSQ_BASE 0x1000ULL
 #define LANDSCAPE_MAX_QIDS 128
+#define LANDSCAPE_DSQ_BASE 0x1000ULL
 #define LANDSCAPE_TASK_F_DATAPLANE (1U << 0)
 
-struct landscape_queue_ctx {
-    __u32 qid;
-    __u32 owner_cpu;
-    __u64 dsq_id;
+#define BPF_STRUCT_OPS(name, args...) SEC("struct_ops/" #name) BPF_PROG(name, ##args)
+#define BPF_STRUCT_OPS_SLEEPABLE(name, args...) SEC("struct_ops.s/" #name) BPF_PROG(name, ##args)
+
+struct landscape_boot_task_ctx {
+	__u32 tid;
+	__u32 qid;
+	__u32 owner_cpu;
+	__u32 flags;
 };
 
-struct landscape_task_ctx {
-    __u32 qid;
-    __u32 owner_cpu;
-    __u32 flags;
+#include "landscape_scx.autogen.h"
+
+static __always_inline __u32 task_tid(struct task_struct *p)
+{
+	return BPF_CORE_READ(p, pid);
+}
+
+static __always_inline bool lookup_boot_task(__u32 tid, struct landscape_boot_task_ctx *out)
+{
+	__u32 i;
+
+	if (!out)
+		return false;
+
+#pragma clang loop unroll(disable)
+	for (i = 0; i < LANDSCAPE_GEN_TASK_COUNT; i++) {
+		if (landscape_gen_tasks[i].tid != tid)
+			continue;
+
+		*out = landscape_gen_tasks[i];
+		return true;
+	}
+
+	return false;
+}
+
+static __always_inline __u64 dsq_for_qid(__u32 qid)
+{
+	return LANDSCAPE_DSQ_BASE + qid;
+}
+
+s32 BPF_STRUCT_OPS(landscape_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+	struct landscape_boot_task_ctx task = {};
+	bool is_idle = false;
+
+	if (lookup_boot_task(task_tid(p), &task) && (task.flags & LANDSCAPE_TASK_F_DATAPLANE))
+		return task.owner_cpu;
+
+	return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+}
+
+s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
+{
+	struct landscape_boot_task_ctx task = {};
+
+	if (lookup_boot_task(task_tid(p), &task) && (task.flags & LANDSCAPE_TASK_F_DATAPLANE)) {
+		scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), SCX_SLICE_DFL, enq_flags);
+		return 0;
+	}
+
+	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+	return 0;
+}
+
+s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
+{
+	__u32 qid;
+
+#pragma clang loop unroll(disable)
+	for (qid = 0; qid < LANDSCAPE_GEN_QUEUE_COUNT; qid++) {
+		if ((__s32)landscape_gen_queue_owner_cpus[qid] != cpu)
+			continue;
+
+		if (scx_bpf_dsq_move_to_local(dsq_for_qid(qid)))
+			return 0;
+	}
+
+	return 0;
+}
+
+s32 BPF_STRUCT_OPS_SLEEPABLE(landscape_init)
+{
+	__u32 qid;
+
+#pragma clang loop unroll(disable)
+	for (qid = 0; qid < LANDSCAPE_GEN_QUEUE_COUNT; qid++)
+		scx_bpf_create_dsq(dsq_for_qid(qid), -1);
+
+	return 0;
+}
+
+s32 BPF_STRUCT_OPS(landscape_exit, struct scx_exit_info *ei)
+{
+	return 0;
+}
+
+SEC(".struct_ops.link")
+struct sched_ext_ops landscape_scx_ops = {
+	.select_cpu		= (void *)landscape_select_cpu,
+	.enqueue		= (void *)landscape_enqueue,
+	.dispatch		= (void *)landscape_dispatch,
+	.init			= (void *)landscape_init,
+	.exit			= (void *)landscape_exit,
+	.dispatch_max_batch	= 64,
+	.flags			= LANDSCAPE_GEN_SCX_FLAGS,
+	.name			= "landscape_scx",
 };
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, LANDSCAPE_MAX_QIDS);
-    __type(key, __u32);
-    __type(value, struct landscape_queue_ctx);
-} qid_to_cpu SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, __u32);
-    __type(value, __u32);
-} cpu_to_qid SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 16384);
-    __type(key, __u32);
-    __type(value, struct landscape_task_ctx);
-} task_to_qid SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, __u32);
-    __type(value, __u8);
-} housekeeping_cpus SEC(".maps");
-
-static __always_inline bool landscape_task_is_dataplane(__u32 pid)
-{
-    struct landscape_task_ctx *task = bpf_map_lookup_elem(&task_to_qid, &pid);
-
-    return task && (task->flags & LANDSCAPE_TASK_F_DATAPLANE);
-}
-
-static __always_inline struct landscape_task_ctx *landscape_lookup_task(__u32 pid)
-{
-    return bpf_map_lookup_elem(&task_to_qid, &pid);
-}
-
-static __always_inline struct landscape_queue_ctx *landscape_lookup_queue(__u32 qid)
-{
-    return bpf_map_lookup_elem(&qid_to_cpu, &qid);
-}
-
-/*
- * Hook skeletons:
- *
- * select_cpu()
- *   - dataplane tasks: return owner_cpu[qid]
- *   - housekeeping/other tasks: keep prev_cpu or fall back to generic policy
- *
- * enqueue()
- *   - dataplane tasks: insert into DSQ[qid]
- *   - others: insert into global / housekeeping DSQ
- *
- * dispatch()
- *   - dataplane CPU: consume its queue DSQ first
- *   - housekeeping CPU: consume housekeeping/global DSQ
- *
- * init()
- *   - create DSQ[qid] for all queue ids pre-populated by user space
- *
- * exit()
- *   - export debug/teardown state later
- */
-
-/*
- * Pseudocode only. The final implementation should use the exact helper set
- * provided by the target kernel's sched_ext headers, for example:
- *
- *   scx_bpf_create_dsq()
- *   scx_bpf_dsq_insert()
- *   scx_bpf_move_to_local()
- *   scx_bpf_select_cpu_dfl()
- */
-
-SEC(".struct_ops")
-int landscape_select_cpu(void *p, int prev_cpu, unsigned long wake_flags)
-{
-    /*
-     * TODO:
-     * 1. lookup task_to_qid[pid]
-     * 2. if dataplane, return owner_cpu
-     * 3. otherwise fall back to default CPU selection
-     */
-    return prev_cpu;
-}
-
-SEC(".struct_ops")
-void landscape_enqueue(void *p, unsigned long enq_flags)
-{
-    /*
-     * TODO:
-     * 1. resolve qid from task_to_qid[pid]
-     * 2. dataplane -> scx_bpf_dsq_insert(..., LANDSCAPE_DSQ_BASE + qid, ...)
-     * 3. non-dataplane -> global/housekeeping DSQ
-     */
-}
-
-SEC(".struct_ops")
-void landscape_dispatch(int cpu, void *prev)
-{
-    /*
-     * TODO:
-     * 1. cpu_to_qid[cpu] decides whether this CPU owns a dataplane DSQ
-     * 2. dataplane CPU pulls its own DSQ into local DSQ
-     * 3. housekeeping CPU pulls housekeeping/global work
-     */
-}
-
-SEC(".struct_ops")
-int landscape_init(void)
-{
-    /*
-     * TODO:
-     * iterate qid_to_cpu and create DSQ[ qid ] = LANDSCAPE_DSQ_BASE + qid
-     */
-    return 0;
-}
-
-SEC(".struct_ops")
-void landscape_exit(void *ei)
-{
-    /* TODO: emit exit diagnostics once the loader supports it. */
-}
-
-/*
- * Final struct_ops registration will look roughly like:
- *
- * struct sched_ext_ops landscape_scx_ops = {
- *   .select_cpu = (void *)landscape_select_cpu,
- *   .enqueue    = (void *)landscape_enqueue,
- *   .dispatch   = (void *)landscape_dispatch,
- *   .init       = (void *)landscape_init,
- *   .exit       = (void *)landscape_exit,
- *   .name       = "landscape_scx",
- *   .flags      = SCX_OPS_SWITCH_PARTIAL,
- * };
- *
- * The first operational version should keep SCX_OPS_SWITCH_PARTIAL enabled.
- * Full switch belongs to a later milestone after housekeeping/global DSQs are
- * proven out for ordinary SCHED_NORMAL tasks.
- */
 
 char LICENSE[] SEC("license") = "GPL";

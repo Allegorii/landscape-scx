@@ -168,6 +168,12 @@ pub struct CustomBpfSchedulerConfig {
     pub housekeeping_cpus: Vec<usize>,
     #[serde(default)]
     pub forwarding_thread_prefixes: Vec<String>,
+    #[serde(default = "default_custom_bpf_source_file")]
+    pub source_file: PathBuf,
+    #[serde(default = "default_custom_bpf_build_dir")]
+    pub build_dir: PathBuf,
+    #[serde(default = "default_custom_bpf_link_dir")]
+    pub link_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +273,9 @@ impl Default for CustomBpfSchedulerConfig {
             switch_mode: default_scx_switch_mode(),
             housekeeping_cpus: Vec::new(),
             forwarding_thread_prefixes: Vec::new(),
+            source_file: default_custom_bpf_source_file(),
+            build_dir: default_custom_bpf_build_dir(),
+            link_dir: default_custom_bpf_link_dir(),
         }
     }
 }
@@ -323,6 +332,18 @@ fn default_scheduler_mode() -> SchedulerMode {
 
 fn default_scx_switch_mode() -> ScxSwitchMode {
     ScxSwitchMode::Partial
+}
+
+fn default_custom_bpf_source_file() -> PathBuf {
+    PathBuf::from("./bpf/landscape_scx.bpf.c")
+}
+
+fn default_custom_bpf_build_dir() -> PathBuf {
+    PathBuf::from("/run/landscape-scx/custom-bpf")
+}
+
+fn default_custom_bpf_link_dir() -> PathBuf {
+    PathBuf::from("/run/landscape-scx/custom-bpf/links")
 }
 
 fn default_scheduler_start_command() -> Vec<String> {
@@ -1552,6 +1573,8 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
         affinity_list_matches, cpu_list_string, cpu_mask_string, matches_target, parse_cpu_mask,
         parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
@@ -1783,6 +1806,10 @@ forwarding_thread_prefixes = ["landscape-forwarder", "pppoe-rx-"]
         assert_eq!(
             cfg.scheduler.custom_bpf.forwarding_thread_prefixes,
             vec!["landscape-forwarder".to_string(), "pppoe-rx-".to_string()]
+        );
+        assert_eq!(
+            cfg.scheduler.custom_bpf.source_file,
+            PathBuf::from("./bpf/landscape_scx.bpf.c")
         );
     }
 }

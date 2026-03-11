@@ -1,0 +1,42 @@
+[discovery]
+process_names = []
+cmdline_keywords = []
+thread_include_prefixes = []
+thread_exclude_prefixes = []
+
+[policy]
+forwarding_cpus = [0]
+control_cpus = [1]
+manage_ksoftirqd = false
+apply_sched_ext = false
+thread_cpu_classes = []
+
+[network]
+interfaces = []
+apply_irq_affinity = false
+apply_xps = false
+apply_rss_equal = false
+apply_combined_channels = false
+clear_inactive_xps = false
+queue_mapping_mode = "round_robin"
+xps_mode = "cpus"
+active_queue_count = 0
+
+[scheduler]
+mode = "custom_bpf"
+start_command = []
+stop_command = []
+pid_file = "/tmp/landscape-scx-local-test.pid"
+ready_timeout_ms = 5000
+fallback_on_error = false
+
+[scheduler.custom_bpf]
+switch_mode = "partial"
+housekeeping_cpus = [1]
+forwarding_thread_prefixes = []
+source_file = "./bpf/landscape_scx.bpf.c"
+build_dir = "/tmp/landscape-scx-local-test"
+link_dir = "/sys/fs/bpf/landscape-scx-local-test-links"
+
+[agent]
+apply_interval_secs = 10
