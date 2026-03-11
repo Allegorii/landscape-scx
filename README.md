@@ -16,7 +16,7 @@ A standalone `sched_ext` project tailored for [landscape](../README.md) deployme
 - `crates/cli`: operator-facing command wrapper.
 - `configs/landscape-scx.toml`: default policy template.
 - `systemd/landscape-scx.service`: service unit example.
-- `bpf/landscape_scx.bpf.c`: placeholder for future SCX BPF scheduler.
+- `bpf/landscape_scx.bpf.c`: queue-island SCX skeleton for the future in-process scheduler.
 
 ## Current State
 
@@ -26,6 +26,7 @@ This initial version implements:
 - scheduler lifecycle (`load/unload`) via external scx command
 - partial switch for matched threads (`SCHED_EXT` + CPU affinity)
 - optional interface-driven IRQ affinity + XPS placement
+- experimental `custom_bpf` scheduler intent generation and BPF hook skeleton
 - dry-run and status modes
 
 ## Build
@@ -147,6 +148,25 @@ That helper currently mirrors IRQ/XPS placement only; `ethtool -X/-L` and inacti
 
 By default `scheduler.start_command = ["scx_cosmos"]`.
 You can set another explicit scheduler command if needed.
+
+## Built-in scheduler skeleton
+
+You can also switch `scheduler.mode` to `custom_bpf` to inspect the generated
+queue/task intent that the future in-process SCX loader will consume:
+
+```toml
+[scheduler]
+mode = "custom_bpf"
+
+[scheduler.custom_bpf]
+switch_mode = "partial"
+housekeeping_cpus = [0, 1]
+forwarding_thread_prefixes = ["landscape-forwarder", "pppoe-rx-"]
+```
+
+Current limitation: the loader is not wired yet, so `custom_bpf` is for
+`status` / intent inspection and BPF skeleton development only. The operational
+path remains `mode = "external_command"`.
 
 ## Integration With Landscape
 

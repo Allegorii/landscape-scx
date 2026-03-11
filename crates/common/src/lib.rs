@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const SCHED_EXT_POLICY: u32 = 7;
+pub const LANDSCAPE_DSQ_BASE: u64 = 0x1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScxConfig {
@@ -131,6 +132,14 @@ pub enum XpsMode {
 pub enum SchedulerMode {
     Disabled,
     ExternalCommand,
+    CustomBpf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScxSwitchMode {
+    Partial,
+    Full,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,12 +156,58 @@ pub struct SchedulerConfig {
     pub ready_timeout_ms: u64,
     #[serde(default = "default_fallback_on_error")]
     pub fallback_on_error: bool,
+    #[serde(default)]
+    pub custom_bpf: CustomBpfSchedulerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomBpfSchedulerConfig {
+    #[serde(default = "default_scx_switch_mode")]
+    pub switch_mode: ScxSwitchMode,
+    #[serde(default)]
+    pub housekeeping_cpus: Vec<usize>,
+    #[serde(default)]
+    pub forwarding_thread_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default = "default_apply_interval_secs")]
     pub apply_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LandscapeSchedulerIntent {
+    pub switch_mode: ScxSwitchMode,
+    pub housekeeping_cpus: Vec<usize>,
+    pub queues: Vec<LandscapeQueueIntent>,
+    pub tasks: Vec<LandscapeTaskIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LandscapeQueueIntent {
+    pub qid: u32,
+    pub interface: String,
+    pub queue_index: usize,
+    pub owner_cpu: usize,
+    pub dsq_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LandscapeTaskKind {
+    Ksoftirqd,
+    ForwardingWorker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LandscapeTaskIntent {
+    pub pid: i32,
+    pub tid: i32,
+    pub comm: String,
+    pub kind: LandscapeTaskKind,
+    pub qid: u32,
+    pub owner_cpu: usize,
 }
 
 impl Default for ScxConfig {
@@ -201,6 +256,17 @@ impl Default for SchedulerConfig {
             pid_file: default_scheduler_pid_file(),
             ready_timeout_ms: default_ready_timeout_ms(),
             fallback_on_error: default_fallback_on_error(),
+            custom_bpf: CustomBpfSchedulerConfig::default(),
+        }
+    }
+}
+
+impl Default for CustomBpfSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            switch_mode: default_scx_switch_mode(),
+            housekeeping_cpus: Vec::new(),
+            forwarding_thread_prefixes: Vec::new(),
         }
     }
 }
@@ -253,6 +319,10 @@ const fn default_enable_sched_ext() -> bool {
 
 fn default_scheduler_mode() -> SchedulerMode {
     SchedulerMode::ExternalCommand
+}
+
+fn default_scx_switch_mode() -> ScxSwitchMode {
+    ScxSwitchMode::Partial
 }
 
 fn default_scheduler_start_command() -> Vec<String> {
@@ -1167,7 +1237,7 @@ fn build_interface_irq_actions(
     Ok(out)
 }
 
-fn desired_locality_cpus(
+pub fn desired_locality_cpus(
     forwarding_cpus: &[usize],
     mode: &QueueMappingMode,
     index: usize,
@@ -1486,8 +1556,8 @@ mod tests {
         affinity_list_matches, cpu_list_string, cpu_mask_string, matches_target, parse_cpu_mask,
         parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
         parse_ksoftirqd_cpu, resolved_network_interfaces, rss_equal_matches, xps_mask_matches,
-        DiscoveryConfig, NetworkConfig, PolicyConfig, QueueMappingMode, SchedulerConfig,
-        SchedulerMode, ScxConfig, XpsMode,
+        CustomBpfSchedulerConfig, DiscoveryConfig, NetworkConfig, PolicyConfig, QueueMappingMode,
+        SchedulerConfig, SchedulerMode, ScxConfig, ScxSwitchMode, XpsMode,
     };
 
     fn test_config() -> ScxConfig {
@@ -1525,6 +1595,7 @@ mod tests {
                 pid_file: "/tmp/landscape-scx-test.pid".into(),
                 ready_timeout_ms: 1000,
                 fallback_on_error: false,
+                custom_bpf: CustomBpfSchedulerConfig::default(),
             },
             agent: super::AgentConfig { apply_interval_secs: 10 },
         }
@@ -1689,5 +1760,29 @@ dead:beef
         assert_eq!(status.used_queues, vec![0, 1, 2, 3, 4, 5, 6, 7]);
         assert!(rss_equal_matches(&status.used_queues, 8));
         assert!(!rss_equal_matches(&status.used_queues, 4));
+    }
+
+    #[test]
+    fn scheduler_config_accepts_custom_bpf_mode() {
+        let cfg: ScxConfig = toml::from_str(
+            r#"
+[scheduler]
+mode = "custom_bpf"
+
+[scheduler.custom_bpf]
+switch_mode = "full"
+housekeeping_cpus = [0, 1]
+forwarding_thread_prefixes = ["landscape-forwarder", "pppoe-rx-"]
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf));
+        assert_eq!(cfg.scheduler.custom_bpf.switch_mode, ScxSwitchMode::Full);
+        assert_eq!(cfg.scheduler.custom_bpf.housekeeping_cpus, vec![0, 1]);
+        assert_eq!(
+            cfg.scheduler.custom_bpf.forwarding_thread_prefixes,
+            vec!["landscape-forwarder".to_string(), "pppoe-rx-".to_string()]
+        );
     }
 }

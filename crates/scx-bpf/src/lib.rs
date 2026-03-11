@@ -5,7 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use landscape_scx_common::{SchedulerConfig, SchedulerMode};
+use landscape_scx_common::{
+    LandscapeSchedulerIntent, LandscapeTaskKind, SchedulerConfig, SchedulerMode,
+};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
@@ -23,6 +25,7 @@ pub fn ensure_scheduler(cfg: &SchedulerConfig) -> Result<()> {
     match cfg.mode {
         SchedulerMode::Disabled => Ok(()),
         SchedulerMode::ExternalCommand => ensure_external_scheduler(cfg),
+        SchedulerMode::CustomBpf => ensure_custom_bpf_scheduler(cfg),
     }
 }
 
@@ -30,7 +33,62 @@ pub fn unload_scheduler(cfg: &SchedulerConfig) -> Result<()> {
     match cfg.mode {
         SchedulerMode::Disabled => Ok(()),
         SchedulerMode::ExternalCommand => unload_external_scheduler(cfg),
+        SchedulerMode::CustomBpf => unload_custom_bpf_scheduler(),
     }
+}
+
+pub fn load_landscape_scheduler(_intent: &LandscapeSchedulerIntent) -> Result<()> {
+    anyhow::bail!(
+        "custom_bpf scheduler loader is not wired yet; use `status` to inspect the generated intent and implement BPF struct_ops loading in crates/scx-bpf next"
+    )
+}
+
+pub fn sync_landscape_scheduler_maps(_intent: &LandscapeSchedulerIntent) -> Result<()> {
+    anyhow::bail!(
+        "custom_bpf map syncing is not wired yet; the generated intent is available from the agent for future qid_to_cpu/cpu_to_qid/task_to_qid updates"
+    )
+}
+
+pub fn describe_landscape_scheduler_intent(intent: &LandscapeSchedulerIntent) -> String {
+    let mut out = String::new();
+    out.push_str("builtin_scheduler_intent:\n");
+    out.push_str(&format!("  switch_mode={:?}\n", intent.switch_mode));
+    out.push_str(&format!(
+        "  housekeeping_cpus={}\n",
+        landscape_scx_common::cpu_list_string(&intent.housekeeping_cpus)
+    ));
+    out.push_str(&format!("  queues={}\n", intent.queues.len()));
+    for queue in &intent.queues {
+        out.push_str(&format!(
+            "    qid={} iface={} queue={} owner_cpu={} dsq=0x{:x}\n",
+            queue.qid, queue.interface, queue.queue_index, queue.owner_cpu, queue.dsq_id
+        ));
+    }
+
+    let ksoftirqd = intent
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.kind, LandscapeTaskKind::Ksoftirqd))
+        .count();
+    let forwarding = intent
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.kind, LandscapeTaskKind::ForwardingWorker))
+        .count();
+    out.push_str(&format!(
+        "  tasks={} ksoftirqd={} forwarding_workers={}\n",
+        intent.tasks.len(),
+        ksoftirqd,
+        forwarding
+    ));
+    for task in &intent.tasks {
+        out.push_str(&format!(
+            "    tid={} pid={} kind={:?} comm={} qid={} owner_cpu={}\n",
+            task.tid, task.pid, task.kind, task.comm, task.qid, task.owner_cpu
+        ));
+    }
+
+    out
 }
 
 fn ensure_external_scheduler(cfg: &SchedulerConfig) -> Result<()> {
@@ -56,6 +114,13 @@ fn ensure_external_scheduler(cfg: &SchedulerConfig) -> Result<()> {
         .with_context(|| format!("failed to write pid file: {}", cfg.pid_file.display()))?;
 
     wait_for_sched_ext(cfg.ready_timeout_ms)
+}
+
+fn ensure_custom_bpf_scheduler(cfg: &SchedulerConfig) -> Result<()> {
+    anyhow::bail!(
+        "scheduler.mode=custom_bpf is configured with switch_mode={:?}, but the in-process BPF loader is not implemented yet; keep using external_command or inspect the generated intent via `status`",
+        cfg.custom_bpf.switch_mode
+    )
 }
 
 fn resolve_start_command(cfg: &SchedulerConfig) -> Result<(String, Vec<String>)> {
@@ -129,6 +194,12 @@ fn unload_external_scheduler(cfg: &SchedulerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn unload_custom_bpf_scheduler() -> Result<()> {
+    anyhow::bail!(
+        "custom_bpf unload is not implemented yet; once the struct_ops loader exists, this path should detach the landscape_scx_ops link"
+    )
 }
 
 fn wait_for_sched_ext(timeout_ms: u64) -> Result<()> {

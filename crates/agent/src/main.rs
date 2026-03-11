@@ -1,18 +1,22 @@
 use std::path::PathBuf;
+use std::{collections::BTreeMap, collections::BTreeSet};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use landscape_scx_bpf::{
-    ensure_scheduler, read_sched_ext_state, sched_ext_enabled, unload_scheduler,
+    describe_landscape_scheduler_intent, ensure_scheduler, read_sched_ext_state,
+    sched_ext_enabled, unload_scheduler,
 };
 use landscape_scx_common::{
     affinity_list_matches, apply_ethtool_combined_channels, apply_ethtool_rss_equal,
     build_network_locality_plans, discover_candidates, get_sched_policy, load_config,
     parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches, sched_policy_name,
     try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config, write_irq_affinity,
-    write_xps_cpus, xps_mask_matches, ScxConfig, ThreadCpuClass,
+    write_xps_cpus, xps_mask_matches, desired_locality_cpus, InterfaceLocalityPlan,
+    LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskIntent, LandscapeTaskKind,
+    SchedulerMode, ScxConfig, ThreadCandidate, ThreadCpuClass, LANDSCAPE_DSQ_BASE,
 };
 use tracing::{error, info, warn};
 
@@ -84,7 +88,7 @@ fn status(config: PathBuf) -> Result<()> {
         sched_ext_enabled(),
         list.len()
     );
-    for c in list {
+    for c in &list {
         println!(
             "pid={} tid={} comm={} cgroup={} cmdline={}",
             c.pid,
@@ -95,6 +99,9 @@ fn status(config: PathBuf) -> Result<()> {
         );
     }
     print_network_status(&cfg)?;
+    if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
+        print_custom_scheduler_intent(&cfg, &list)?;
+    }
     Ok(())
 }
 
@@ -236,6 +243,13 @@ fn print_network_status(cfg: &ScxConfig) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn print_custom_scheduler_intent(cfg: &ScxConfig, candidates: &[ThreadCandidate]) -> Result<()> {
+    let plans = build_network_locality_plans(cfg)?;
+    let intent = build_landscape_scheduler_intent(cfg, &plans, candidates);
+    print!("{}", describe_landscape_scheduler_intent(&intent));
     Ok(())
 }
 
@@ -565,6 +579,108 @@ fn apply_partial_switch(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn build_landscape_scheduler_intent(
+    cfg: &ScxConfig,
+    plans: &[InterfaceLocalityPlan],
+    candidates: &[ThreadCandidate],
+) -> LandscapeSchedulerIntent {
+    let housekeeping_cpus = effective_housekeeping_cpus(cfg);
+    let mut queues = Vec::new();
+    let mut owner_cpu_to_qid = BTreeMap::new();
+    let mut qid = 0u32;
+
+    for plan in plans {
+        for queue_index in 0..plan.active_queue_count {
+            let Some(owner_cpu) = desired_locality_cpus(
+                &plan.forwarding_cpus,
+                &plan.queue_mapping_mode,
+                queue_index,
+            )
+            .into_iter()
+            .next()
+            else {
+                continue;
+            };
+
+            owner_cpu_to_qid.insert(owner_cpu, qid);
+            queues.push(LandscapeQueueIntent {
+                qid,
+                interface: plan.interface.clone(),
+                queue_index,
+                owner_cpu,
+                dsq_id: LANDSCAPE_DSQ_BASE + qid as u64,
+            });
+            qid += 1;
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut tasks = Vec::new();
+    for candidate in candidates {
+        let task = if let Some(cpu) = parse_ksoftirqd_cpu(&candidate.comm) {
+            owner_cpu_to_qid.get(&cpu).copied().map(|qid| LandscapeTaskIntent {
+                pid: candidate.pid,
+                tid: candidate.tid,
+                comm: candidate.comm.clone(),
+                kind: LandscapeTaskKind::Ksoftirqd,
+                qid,
+                owner_cpu: cpu,
+            })
+        } else if matches_forwarding_worker(cfg, &candidate.comm) {
+            let action = thread_policy_action(cfg, &candidate.comm);
+            if action.cpus.len() == 1 {
+                let owner_cpu = action.cpus[0];
+                owner_cpu_to_qid.get(&owner_cpu).copied().map(|qid| LandscapeTaskIntent {
+                    pid: candidate.pid,
+                    tid: candidate.tid,
+                    comm: candidate.comm.clone(),
+                    kind: LandscapeTaskKind::ForwardingWorker,
+                    qid,
+                    owner_cpu,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let Some(task) = task else {
+            continue;
+        };
+        if seen.insert(task.tid) {
+            tasks.push(task);
+        }
+    }
+
+    tasks.sort_by(|a, b| a.qid.cmp(&b.qid).then_with(|| a.tid.cmp(&b.tid)));
+
+    LandscapeSchedulerIntent {
+        switch_mode: cfg.scheduler.custom_bpf.switch_mode.clone(),
+        housekeeping_cpus,
+        queues,
+        tasks,
+    }
+}
+
+fn effective_housekeeping_cpus(cfg: &ScxConfig) -> Vec<usize> {
+    if !cfg.scheduler.custom_bpf.housekeeping_cpus.is_empty() {
+        return cfg.scheduler.custom_bpf.housekeeping_cpus.clone();
+    }
+    if !cfg.policy.control_cpus.is_empty() {
+        return cfg.policy.control_cpus.clone();
+    }
+    cfg.policy.forwarding_cpus.clone()
+}
+
+fn matches_forwarding_worker(cfg: &ScxConfig, comm: &str) -> bool {
+    cfg.scheduler
+        .custom_bpf
+        .forwarding_thread_prefixes
+        .iter()
+        .any(|prefix| !prefix.is_empty() && comm.starts_with(prefix))
+}
+
 #[derive(Debug, Clone)]
 struct ThreadPolicyAction {
     cpus: Vec<usize>,
@@ -640,7 +756,11 @@ fn load_or_default(path: PathBuf) -> Result<ScxConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::{thread_policy_action, ScxConfig, ThreadCpuClass};
+    use super::{build_landscape_scheduler_intent, thread_policy_action, ScxConfig, ThreadCpuClass};
+    use landscape_scx_common::{
+        InterfaceLocalityPlan, InterfaceLocalityStatus, LandscapeTaskKind, QueueMappingMode,
+        ThreadCandidate, XpsMode,
+    };
 
     #[test]
     fn class_can_disable_sched_ext_without_disabling_affinity() {
@@ -666,5 +786,66 @@ mod tests {
         assert_eq!(action.cpus, vec![3]);
         assert!(action.apply_sched_ext);
         assert!(!action.apply_affinity);
+    }
+
+    #[test]
+    fn builtin_intent_maps_ksoftirqd_cpu_to_queue_owner() {
+        let mut cfg = ScxConfig::default();
+        cfg.scheduler.mode = landscape_scx_common::SchedulerMode::CustomBpf;
+        cfg.scheduler.custom_bpf.housekeeping_cpus = vec![6, 7];
+
+        let plan = InterfaceLocalityPlan {
+            interface: "eth0".into(),
+            forwarding_cpus: vec![2, 3],
+            queue_mapping_mode: QueueMappingMode::RoundRobin,
+            xps_mode: XpsMode::Cpus,
+            apply_rss_equal: false,
+            apply_combined_channels: false,
+            clear_inactive_xps: false,
+            active_queue_count: 2,
+            total_tx_queues: 2,
+            total_rx_queues: 2,
+            total_irqs: 2,
+            status: InterfaceLocalityStatus {
+                interface: "eth0".into(),
+                tx_xps_cpus: Vec::new(),
+                tx_xps_rxqs: Vec::new(),
+                rx_queues: Vec::new(),
+                irqs: Vec::new(),
+                channel_status: None,
+                rss_status: None,
+            },
+            channel_action: None,
+            rss_action: None,
+            xps_actions: Vec::new(),
+            inactive_xps_actions: Vec::new(),
+            irq_actions: Vec::new(),
+        };
+        let candidates = vec![
+            ThreadCandidate {
+                pid: 15,
+                tid: 15,
+                comm: "ksoftirqd/2".into(),
+                cmdline: String::new(),
+                cgroup: String::new(),
+            },
+            ThreadCandidate {
+                pid: 16,
+                tid: 16,
+                comm: "ksoftirqd/3".into(),
+                cmdline: String::new(),
+                cgroup: String::new(),
+            },
+        ];
+
+        let intent = build_landscape_scheduler_intent(&cfg, &[plan], &candidates);
+        assert_eq!(intent.housekeeping_cpus, vec![6, 7]);
+        assert_eq!(intent.queues.len(), 2);
+        assert_eq!(intent.tasks.len(), 2);
+        assert_eq!(intent.tasks[0].kind, LandscapeTaskKind::Ksoftirqd);
+        assert_eq!(intent.tasks[0].qid, 0);
+        assert_eq!(intent.tasks[0].owner_cpu, 2);
+        assert_eq!(intent.tasks[1].qid, 1);
+        assert_eq!(intent.tasks[1].owner_cpu, 3);
     }
 }
