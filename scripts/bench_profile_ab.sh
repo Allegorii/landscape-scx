@@ -110,10 +110,30 @@ if [[ -z "$AGENT_BIN" ]]; then
   fi
 fi
 
+ensure_agent_bin_fresh() {
+  local bin_path="$1"
+  if [[ "$bin_path" != "$ROOT_DIR/target/debug/landscape-scx-agent" ]]; then
+    return 0
+  fi
+
+  if find \
+    "$ROOT_DIR/Cargo.toml" \
+    "$ROOT_DIR/Cargo.lock" \
+    "$ROOT_DIR/crates" \
+    "$ROOT_DIR/bpf" \
+    "$ROOT_DIR/configs" \
+    -type f -newer "$bin_path" -print -quit | grep -q .; then
+    echo "[info] rebuilding landscape-scx-agent because sources are newer than $bin_path" | tee -a "$LOG"
+    (cd "$ROOT_DIR" && cargo build -p landscape-scx-agent) >> "$LOG" 2>&1
+  fi
+}
+
 mkdir -p "$OUT_DIR"
 TS="$(date +%Y%m%d-%H%M%S)"
 CSV="$OUT_DIR/profile-ab-$TS.csv"
 LOG="$OUT_DIR/profile-ab-$TS.log"
+
+ensure_agent_bin_fresh "$AGENT_BIN"
 
 cleanup_pids=()
 cleanup() {
