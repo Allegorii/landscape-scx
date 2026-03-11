@@ -54,6 +54,37 @@ sudo ./scripts/bench_schedulers_multi.sh \
 This mode aggregates throughput across multiple interfaces and also outputs
 per-interface throughput breakdown fields in CSV/Markdown.
 
+## Profile A/B mode
+
+Use the profile A/B helper when you want to compare two full agent configs
+directly, such as `scx_cosmos` vs the built-in `custom_bpf` scheduler on the
+same host.
+
+```bash
+sudo ./scripts/bench_profile_ab.sh \
+  --baseline-config ./configs/profiles/archld-32c-dualwan-8q.toml \
+  --candidate-config ./configs/profiles/archld-32c-dualwan-8q-custom-bpf.toml \
+  --baseline-label cosmos \
+  --candidate-label custom_bpf \
+  --ifaces ens27f0,ens16f1np1 \
+  --duration 60 --warmup 10
+```
+
+This mode records:
+
+- `sched_ext_state` and `sched_ext_ops`
+- overall CPU utilization percentage
+- aggregate interface throughput and per-interface throughput
+- `NET_RX` / `NET_TX` softirq deltas
+- context switch delta (`ctxt`)
+- optional ping loss/latency
+- per-interface `q0-7` and `q8+` IRQ deltas
+
+Output:
+
+- CSV: `output/bench-ab/profile-ab-<timestamp>.csv`
+- Log: `output/bench-ab/profile-ab-<timestamp>.log`
+
 ## Output
 
 - CSV: `output/bench/bench-<timestamp>.csv`
