@@ -16,8 +16,8 @@ use nix::unistd::Pid;
 const LANDSCAPE_TASK_F_DATAPLANE: u32 = 1;
 const QID_OWNER_MAP_NAME: &str = "qid_owner_map";
 const TASK_CTX_MAP_NAME: &str = "task_ctx_map";
-const HOUSEKEEPING_CPU_MAP_NAME: &str = "housekeeping_cpu_map";
-const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "housekeeping_default_cpu_map";
+const HOUSEKEEPING_CPU_MAP_NAME: &str = "hk_cpu_map";
+const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "hk_defcpu_map";
 const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

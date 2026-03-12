@@ -60,14 +60,14 @@ struct {
 	__uint(max_entries, 256);
 	__type(key, __u32);
 	__type(value, __u8);
-} housekeeping_cpu_map SEC(".maps");
+} hk_cpu_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, __u32);
-} housekeeping_default_cpu_map SEC(".maps");
+} hk_defcpu_map SEC(".maps");
 
 #include "landscape_scx.autogen.h"
 
@@ -95,7 +95,7 @@ static __always_inline bool is_housekeeping_cpu(__u32 cpu)
 {
 	__u8 *value;
 
-	value = bpf_map_lookup_elem(&housekeeping_cpu_map, &cpu);
+	value = bpf_map_lookup_elem(&hk_cpu_map, &cpu);
 	return value && *value;
 }
 
@@ -107,7 +107,7 @@ static __always_inline bool default_housekeeping_cpu(__u32 *cpu)
 	if (!cpu)
 		return false;
 
-	value = bpf_map_lookup_elem(&housekeeping_default_cpu_map, &key);
+	value = bpf_map_lookup_elem(&hk_defcpu_map, &key);
 	if (!value)
 		return false;
 
