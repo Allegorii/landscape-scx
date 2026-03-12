@@ -76,7 +76,12 @@ This mode records:
 - overall CPU utilization percentage
 - aggregate interface throughput and per-interface throughput
 - `NET_RX` / `NET_TX` softirq deltas
+- `softnet_stat` dropped / time_squeeze deltas
 - context switch delta (`ctxt`)
+- per-interface per-queue IRQ deltas
+- `ksoftirqd/*` CPU time delta
+- dataplane `irq/*` thread CPU time delta
+- optional `perf stat` counters (`cache-misses`, `cache-references`, `LLC-load-misses`)
 - optional ping loss/latency
 - per-interface `q0-7` and `q8+` IRQ deltas
 
@@ -84,6 +89,19 @@ Output:
 
 - CSV: `output/bench-ab/profile-ab-<timestamp>.csv`
 - Log: `output/bench-ab/profile-ab-<timestamp>.log`
+
+Optional knobs:
+
+- `--perf-events cache-misses,cache-references,LLC-load-misses`
+- `--no-perf`
+
+The CSV keeps aggregate fields compact enough for quick comparison, while the
+log also records detailed locality diagnostics such as:
+
+- `irq_queue_delta_by_iface`
+- `ksoftirqd_cpu_secs_by_comm`
+- `irq_thread_cpu_secs_by_comm`
+- `softnet_dropped_delta` / `softnet_time_squeeze_delta`
 
 ## Output
 
@@ -96,5 +114,10 @@ Output:
 ## Notes
 
 - Run on stable traffic and equal workload windows.
-- This script provides coarse-grained system metrics; combine with your own
-  p95/p99 latency and throughput tooling for final decisions.
+- These metrics are intended to explain *why* a profile wins or loses:
+  - `softnet_dropped_delta` / `time_squeeze` point to RX backlog pressure
+  - per-queue IRQ deltas show whether traffic stays on the intended queue set
+  - `ksoftirqd` / `irq/*` CPU time show where dataplane CPU time moved
+  - cache / LLC miss counters help spot locality regressions
+- Combine them with your own p95/p99 latency and workload-native throughput
+  tooling for final decisions.
