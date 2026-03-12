@@ -85,13 +85,110 @@ struct ReconcileWatchTarget {
     mask: u32,
 }
 
+const CN_IDX_PROC: u32 = 0x1;
+const CN_VAL_PROC: u32 = 0x1;
+const PROC_CN_MCAST_LISTEN: u32 = 1;
+const PROC_CN_MCAST_IGNORE: u32 = 2;
+const PROC_EVENT_FORK: u32 = 0x0000_0001;
+const PROC_EVENT_EXEC: u32 = 0x0000_0002;
+const PROC_EVENT_COMM: u32 = 0x0000_0200;
+const PROC_EVENT_EXIT: u32 = 0x8000_0000;
+const PROC_EVENT_ALL: u32 = PROC_EVENT_FORK | PROC_EVENT_EXEC | PROC_EVENT_COMM | PROC_EVENT_EXIT;
+const NLMSG_DONE: u16 = 0x3;
+const NLMSG_ALIGNTO: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NetlinkMessageHeader {
+    nlmsg_len: u32,
+    nlmsg_type: u16,
+    nlmsg_flags: u16,
+    nlmsg_seq: u32,
+    nlmsg_pid: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConnectorId {
+    idx: u32,
+    val: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConnectorMessageHeader {
+    id: ConnectorId,
+    seq: u32,
+    ack: u32,
+    len: u16,
+    flags: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcInput {
+    mcast_op: u32,
+    event_type: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcConnectorListenMessage {
+    nl: NetlinkMessageHeader,
+    cn: ConnectorMessageHeader,
+    input: ProcInput,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcEventHeader {
+    what: u32,
+    cpu: u32,
+    timestamp_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ForkProcEvent {
+    parent_pid: i32,
+    parent_tgid: i32,
+    child_pid: i32,
+    child_tgid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExecProcEvent {
+    process_pid: i32,
+    process_tgid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CommProcEvent {
+    process_pid: i32,
+    process_tgid: i32,
+    comm: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExitProcEvent {
+    process_pid: i32,
+    process_tgid: i32,
+    exit_code: u32,
+    exit_signal: u32,
+    parent_pid: i32,
+    parent_tgid: i32,
+}
+
 #[derive(Debug)]
-struct ReconcileWatcher {
+struct InotifyReconcileWatcher {
     fd: RawFd,
     debounce_ms: u64,
 }
 
-impl ReconcileWatcher {
+impl InotifyReconcileWatcher {
     fn new(cfg: &ScxConfig, candidates: &[ThreadCandidate]) -> Result<Option<Self>> {
         let desired_targets = collect_reconcile_watch_targets(cfg, candidates);
         if desired_targets.is_empty() {
@@ -211,12 +308,331 @@ impl ReconcileWatcher {
     }
 }
 
-impl Drop for ReconcileWatcher {
+impl Drop for InotifyReconcileWatcher {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);
         }
     }
+}
+
+#[derive(Debug)]
+struct ProcConnectorWatcher {
+    fd: RawFd,
+    debounce_ms: u64,
+    tracked_tgids: BTreeSet<i32>,
+    tracked_cgroup_paths: BTreeSet<String>,
+}
+
+impl ProcConnectorWatcher {
+    fn new(cfg: &ScxConfig, candidates: &[ThreadCandidate]) -> Result<Option<Self>> {
+        let tracked_tgids = candidates
+            .iter()
+            .filter(|candidate| parse_ksoftirqd_cpu(&candidate.comm).is_none())
+            .map(|candidate| candidate.pid)
+            .collect::<BTreeSet<_>>();
+        let mut tracked_cgroup_paths = cfg
+            .discovery
+            .cgroup_prefixes
+            .iter()
+            .map(|path| path.to_string())
+            .collect::<BTreeSet<_>>();
+        for candidate in candidates {
+            if parse_ksoftirqd_cpu(&candidate.comm).is_some() {
+                continue;
+            }
+            tracked_cgroup_paths.extend(parse_proc_cgroup_paths(&candidate.cgroup));
+        }
+
+        if tracked_tgids.is_empty() && tracked_cgroup_paths.is_empty() {
+            return Ok(None);
+        }
+
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_CONNECTOR) };
+        if fd < 0 {
+            return Err(anyhow::anyhow!(
+                "proc connector socket creation failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        let mut bind_addr = unsafe { std::mem::zeroed::<libc::sockaddr_nl>() };
+        bind_addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        bind_addr.nl_pid = std::process::id();
+        bind_addr.nl_groups = CN_IDX_PROC;
+        let bind_rc = unsafe {
+            libc::bind(
+                fd,
+                (&bind_addr as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if bind_rc < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(anyhow::anyhow!("proc connector bind failed: {}", err));
+        }
+
+        let group = CN_IDX_PROC as libc::c_int;
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_NETLINK,
+                libc::NETLINK_ADD_MEMBERSHIP,
+                (&group as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+
+        if let Err(err) = send_proc_connector_mcast(fd, PROC_CN_MCAST_LISTEN, PROC_EVENT_ALL) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(err);
+        }
+
+        Ok(Some(Self {
+            fd,
+            debounce_ms: cfg.agent.event_debounce_ms,
+            tracked_tgids,
+            tracked_cgroup_paths,
+        }))
+    }
+
+    fn wait(&mut self, interval: Duration) -> Result<ReconcileTrigger> {
+        let mut pollfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+        loop {
+            let rc = unsafe { libc::poll(&mut pollfd, 1, poll_timeout_ms(interval)) };
+            if rc == 0 {
+                return Ok(ReconcileTrigger::Interval);
+            }
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow::anyhow!("poll on proc connector failed: {}", err));
+            }
+            if (pollfd.revents & libc::POLLIN) == 0 {
+                return Err(anyhow::anyhow!(
+                    "proc connector returned unexpected revents={:#x}",
+                    pollfd.revents
+                ));
+            }
+
+            if self.drain_events()? {
+                self.debounce()?;
+                return Ok(ReconcileTrigger::Event);
+            }
+        }
+    }
+
+    fn debounce(&mut self) -> Result<()> {
+        if self.debounce_ms == 0 {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(self.debounce_ms);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut pollfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            let rc = unsafe { libc::poll(&mut pollfd, 1, poll_timeout_ms(remaining)) };
+            if rc == 0 {
+                break;
+            }
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow::anyhow!("poll during proc connector debounce failed: {}", err));
+            }
+            if (pollfd.revents & libc::POLLIN) != 0 {
+                let _ = self.drain_events()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drain_events(&mut self) -> Result<bool> {
+        let mut buf = [0u8; 8192];
+        let mut triggered = false;
+        loop {
+            let rc = unsafe { libc::recv(self.fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+            if rc == 0 {
+                return Ok(triggered);
+            }
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(triggered);
+                }
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow::anyhow!("failed to read proc connector event: {}", err));
+            }
+
+            let mut offset = 0usize;
+            let total = rc as usize;
+            while offset + std::mem::size_of::<NetlinkMessageHeader>() <= total {
+                let header = unsafe {
+                    &*(buf[offset..].as_ptr().cast::<NetlinkMessageHeader>())
+                };
+                let message_len = (header.nlmsg_len as usize).min(total.saturating_sub(offset));
+                if message_len < std::mem::size_of::<NetlinkMessageHeader>() {
+                    break;
+                }
+
+                if header.nlmsg_type == NLMSG_DONE {
+                    let payload = &buf[offset + std::mem::size_of::<NetlinkMessageHeader>()..offset + message_len];
+                    if self.message_matches_scope(payload) {
+                        triggered = true;
+                    }
+                }
+
+                let aligned = nlmsg_align(header.nlmsg_len as usize);
+                if aligned == 0 {
+                    break;
+                }
+                offset = offset.saturating_add(aligned);
+            }
+        }
+    }
+
+    fn message_matches_scope(&self, payload: &[u8]) -> bool {
+        if payload.len() < std::mem::size_of::<ConnectorMessageHeader>() {
+            return false;
+        }
+        let cn = unsafe { &*(payload.as_ptr().cast::<ConnectorMessageHeader>()) };
+        if cn.id.idx != CN_IDX_PROC || cn.id.val != CN_VAL_PROC {
+            return false;
+        }
+        let event_bytes = &payload[std::mem::size_of::<ConnectorMessageHeader>()..];
+        let Some((pid, tgid)) = parse_proc_connector_event_scope(event_bytes) else {
+            return false;
+        };
+
+        if self.tracked_tgids.contains(&tgid) || self.tracked_tgids.contains(&pid) {
+            return true;
+        }
+
+        if self.tracked_cgroup_paths.is_empty() {
+            return false;
+        }
+
+        let cgroup = read_proc_cgroup(tgid).or_else(|| read_proc_cgroup(pid));
+        let Some(cgroup) = cgroup else {
+            return false;
+        };
+        self.tracked_cgroup_paths.iter().any(|path| cgroup.contains(path))
+    }
+}
+
+impl Drop for ProcConnectorWatcher {
+    fn drop(&mut self) {
+        let _ = send_proc_connector_mcast(self.fd, PROC_CN_MCAST_IGNORE, PROC_EVENT_ALL);
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn send_proc_connector_mcast(fd: RawFd, mcast_op: u32, event_type: u32) -> Result<()> {
+    let mut kernel_addr = unsafe { std::mem::zeroed::<libc::sockaddr_nl>() };
+    kernel_addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    kernel_addr.nl_pid = 0;
+    kernel_addr.nl_groups = CN_IDX_PROC;
+
+    let msg = ProcConnectorListenMessage {
+        nl: NetlinkMessageHeader {
+            nlmsg_len: std::mem::size_of::<ProcConnectorListenMessage>() as u32,
+            nlmsg_type: NLMSG_DONE,
+            nlmsg_flags: 0,
+            nlmsg_seq: 0,
+            nlmsg_pid: std::process::id(),
+        },
+        cn: ConnectorMessageHeader {
+            id: ConnectorId { idx: CN_IDX_PROC, val: CN_VAL_PROC },
+            seq: 0,
+            ack: 0,
+            len: std::mem::size_of::<ProcInput>() as u16,
+            flags: 0,
+        },
+        input: ProcInput { mcast_op, event_type },
+    };
+
+    let rc = unsafe {
+        libc::sendto(
+            fd,
+            (&msg as *const ProcConnectorListenMessage).cast(),
+            std::mem::size_of::<ProcConnectorListenMessage>(),
+            0,
+            (&kernel_addr as *const libc::sockaddr_nl).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(anyhow::anyhow!(
+            "proc connector mcast {} failed: {}",
+            mcast_op,
+            io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
+fn nlmsg_align(len: usize) -> usize {
+    (len + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1)
+}
+
+fn parse_proc_connector_event_scope(event_bytes: &[u8]) -> Option<(i32, i32)> {
+    if event_bytes.len() < std::mem::size_of::<ProcEventHeader>() {
+        return None;
+    }
+
+    let header = unsafe { &*(event_bytes.as_ptr().cast::<ProcEventHeader>()) };
+    let payload = &event_bytes[std::mem::size_of::<ProcEventHeader>()..];
+
+    match header.what {
+        PROC_EVENT_FORK => {
+            if payload.len() < std::mem::size_of::<ForkProcEvent>() {
+                return None;
+            }
+            let event = unsafe { &*(payload.as_ptr().cast::<ForkProcEvent>()) };
+            Some((event.child_pid, event.child_tgid))
+        }
+        PROC_EVENT_EXEC => {
+            if payload.len() < std::mem::size_of::<ExecProcEvent>() {
+                return None;
+            }
+            let event = unsafe { &*(payload.as_ptr().cast::<ExecProcEvent>()) };
+            Some((event.process_pid, event.process_tgid))
+        }
+        PROC_EVENT_COMM => {
+            if payload.len() < std::mem::size_of::<CommProcEvent>() {
+                return None;
+            }
+            let event = unsafe { &*(payload.as_ptr().cast::<CommProcEvent>()) };
+            Some((event.process_pid, event.process_tgid))
+        }
+        PROC_EVENT_EXIT => {
+            if payload.len() < std::mem::size_of::<ExitProcEvent>() {
+                return None;
+            }
+            let event = unsafe { &*(payload.as_ptr().cast::<ExitProcEvent>()) };
+            Some((event.process_pid, event.process_tgid))
+        }
+        _ => None,
+    }
+}
+
+fn read_proc_cgroup(pid: i32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()
 }
 
 fn main() -> Result<()> {
@@ -384,12 +800,22 @@ fn wait_for_reconcile_trigger(
     candidates: &[ThreadCandidate],
 ) -> Result<ReconcileTrigger> {
     let interval = Duration::from_secs(cfg.agent.apply_interval_secs);
-    let Some(mut watcher) = ReconcileWatcher::new(cfg, candidates)? else {
-        thread::sleep(interval);
-        return Ok(ReconcileTrigger::Interval);
-    };
+    match ProcConnectorWatcher::new(cfg, candidates) {
+        Ok(Some(mut watcher)) => return watcher.wait(interval),
+        Ok(None) => {}
+        Err(err) => {
+            warn!("proc connector watcher unavailable, fallback to inotify: {}", err);
+        }
+    }
 
-    watcher.wait(interval)
+    match InotifyReconcileWatcher::new(cfg, candidates) {
+        Ok(Some(mut watcher)) => watcher.wait(interval),
+        Ok(None) => {
+            thread::sleep(interval);
+            Ok(ReconcileTrigger::Interval)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn collect_reconcile_watch_targets(
@@ -1373,7 +1799,9 @@ fn load_or_default(path: PathBuf) -> Result<ScxConfig> {
 mod tests {
     use super::{
         build_landscape_scheduler_intent, builtin_task_policy_action,
-        collect_reconcile_watch_targets, thread_policy_action, ScxConfig, ThreadCpuClass,
+        collect_reconcile_watch_targets, parse_proc_connector_event_scope, thread_policy_action,
+        ExecProcEvent, ForkProcEvent, ProcEventHeader, ScxConfig, ThreadCpuClass,
+        PROC_EVENT_EXEC, PROC_EVENT_FORK,
     };
     use landscape_scx_common::{
         InterfaceLocalityPlan, InterfaceLocalityStatus, LandscapeTaskIntent, LandscapeTaskKind,
@@ -1640,6 +2068,43 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert!(target_paths.contains(&std::path::PathBuf::from("/proc")));
+    }
+
+    #[test]
+    fn parse_proc_connector_scope_uses_fork_child_identity() {
+        let event = (
+            ProcEventHeader { what: PROC_EVENT_FORK, cpu: 3, timestamp_ns: 42 },
+            ForkProcEvent {
+                parent_pid: 10,
+                parent_tgid: 10,
+                child_pid: 21,
+                child_tgid: 20,
+            },
+        );
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&event as *const (ProcEventHeader, ForkProcEvent)).cast::<u8>(),
+                std::mem::size_of::<(ProcEventHeader, ForkProcEvent)>(),
+            )
+        };
+
+        assert_eq!(parse_proc_connector_event_scope(bytes), Some((21, 20)));
+    }
+
+    #[test]
+    fn parse_proc_connector_scope_uses_exec_identity() {
+        let event = (
+            ProcEventHeader { what: PROC_EVENT_EXEC, cpu: 1, timestamp_ns: 7 },
+            ExecProcEvent { process_pid: 88, process_tgid: 77 },
+        );
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&event as *const (ProcEventHeader, ExecProcEvent)).cast::<u8>(),
+                std::mem::size_of::<(ProcEventHeader, ExecProcEvent)>(),
+            )
+        };
+
+        assert_eq!(parse_proc_connector_event_scope(bytes), Some((88, 77)));
     }
 
     #[test]

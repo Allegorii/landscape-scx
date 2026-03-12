@@ -90,7 +90,7 @@ link_dir = "/run/landscape-scx/custom-bpf/links"
 [agent]
 # Periodic reconcile fallback when no relevant events arrive.
 apply_interval_secs = 5
-# Enable fast-path reconcile on cgroup.procs and /proc/<pid>/task changes.
+# Enable fast-path reconcile via proc connector, with cgroup/proc watches as fallback.
 event_driven = true
 # Coalesce bursts of thread/process churn before one reconcile pass.
 event_debounce_ms = 250
