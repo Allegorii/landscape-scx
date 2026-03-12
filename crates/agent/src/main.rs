@@ -1,9 +1,13 @@
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
+use std::io;
+use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
-use std::{collections::BTreeMap, collections::BTreeSet};
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use landscape_scx_bpf::{
     describe_landscape_scheduler_intent, ensure_landscape_scheduler, ensure_scheduler,
@@ -60,6 +64,161 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileTrigger {
+    Event,
+    Interval,
+}
+
+impl ReconcileTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Interval => "interval",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReconcileWatchTarget {
+    path: PathBuf,
+    mask: u32,
+}
+
+#[derive(Debug)]
+struct ReconcileWatcher {
+    fd: RawFd,
+    debounce_ms: u64,
+}
+
+impl ReconcileWatcher {
+    fn new(cfg: &ScxConfig, candidates: &[ThreadCandidate]) -> Result<Option<Self>> {
+        let desired_targets = collect_reconcile_watch_targets(cfg, candidates);
+        if desired_targets.is_empty() {
+            return Ok(None);
+        }
+
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            return Err(anyhow::anyhow!("inotify_init1 failed: {}", io::Error::last_os_error()));
+        }
+
+        let mut watch_count = 0usize;
+        for target in desired_targets {
+            if !target.path.exists() {
+                continue;
+            }
+
+            let raw_path = target.path.as_os_str().as_bytes();
+            let c_path = CString::new(raw_path)
+                .with_context(|| format!("watch path contains NUL: {}", target.path.display()))?;
+            let wd = unsafe { libc::inotify_add_watch(fd, c_path.as_ptr(), target.mask) };
+            if wd < 0 {
+                warn!(
+                    "event-driven reconcile watch failed path={} err={}",
+                    target.path.display(),
+                    io::Error::last_os_error()
+                );
+                continue;
+            }
+
+            watch_count += 1;
+        }
+
+        if watch_count == 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(Self { fd, debounce_ms: cfg.agent.event_debounce_ms }))
+    }
+
+    fn wait(&mut self, interval: Duration) -> Result<ReconcileTrigger> {
+        let mut pollfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+        loop {
+            let rc = unsafe { libc::poll(&mut pollfd, 1, poll_timeout_ms(interval)) };
+            if rc == 0 {
+                return Ok(ReconcileTrigger::Interval);
+            }
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow::anyhow!("poll on reconcile watcher failed: {}", err));
+            }
+            if (pollfd.revents & libc::POLLIN) == 0 {
+                return Err(anyhow::anyhow!(
+                    "reconcile watcher returned unexpected revents={:#x}",
+                    pollfd.revents
+                ));
+            }
+
+            self.drain_events()?;
+            self.debounce()?;
+            return Ok(ReconcileTrigger::Event);
+        }
+    }
+
+    fn debounce(&mut self) -> Result<()> {
+        if self.debounce_ms == 0 {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(self.debounce_ms);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut pollfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            let rc = unsafe { libc::poll(&mut pollfd, 1, poll_timeout_ms(remaining)) };
+            if rc == 0 {
+                break;
+            }
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow::anyhow!("poll during debounce failed: {}", err));
+            }
+            if (pollfd.revents & libc::POLLIN) != 0 {
+                self.drain_events()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drain_events(&mut self) -> Result<()> {
+        let mut buf = [0u8; 4096];
+        loop {
+            let rc = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if rc == 0 {
+                return Ok(());
+            }
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(anyhow::anyhow!("failed to drain reconcile watcher: {}", err));
+            }
+        }
+    }
+}
+
+impl Drop for ReconcileWatcher {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -88,8 +247,7 @@ fn status(config: PathBuf) -> Result<()> {
     let list = if let Some(prepared) = &prepared {
         prepared.candidates.clone()
     } else {
-        let self_pid = std::process::id() as i32;
-        discover_candidates(&cfg)?.into_iter().filter(|c| c.pid != self_pid).collect()
+        discover_agent_candidates(&cfg)?
     };
     info!(
         "sched_ext state={} enabled={} matched_threads={}",
@@ -156,19 +314,186 @@ fn run(config: PathBuf, dry_run: bool, once: bool) -> Result<()> {
     }
 
     loop {
-        apply_network_locality(&cfg, dry_run)?;
-        if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
-            run_custom_bpf_cycle(&cfg, dry_run)?;
-        } else {
-            apply_partial_switch(&cfg, dry_run)?;
-        }
+        let candidates = reconcile_once(&cfg, dry_run)?;
         if once {
             break;
         }
-        thread::sleep(Duration::from_secs(cfg.agent.apply_interval_secs));
+
+        let trigger = if cfg.agent.event_driven {
+            match wait_for_reconcile_trigger(&cfg, &candidates) {
+                Ok(trigger) => trigger,
+                Err(err) => {
+                    warn!(
+                        "event-driven reconcile wait failed, fallback to interval sleep: {}",
+                        err
+                    );
+                    thread::sleep(Duration::from_secs(cfg.agent.apply_interval_secs));
+                    ReconcileTrigger::Interval
+                }
+            }
+        } else {
+            thread::sleep(Duration::from_secs(cfg.agent.apply_interval_secs));
+            ReconcileTrigger::Interval
+        };
+        info!(
+            "reconcile trigger={} fallback_interval={}s",
+            trigger.as_str(),
+            cfg.agent.apply_interval_secs
+        );
     }
 
     Ok(())
+}
+
+fn discover_agent_candidates(cfg: &ScxConfig) -> Result<Vec<ThreadCandidate>> {
+    let self_pid = std::process::id() as i32;
+    Ok(discover_candidates(cfg)?
+        .into_iter()
+        .filter(|candidate| candidate.pid != self_pid)
+        .collect())
+}
+
+fn reconcile_once(cfg: &ScxConfig, dry_run: bool) -> Result<Vec<ThreadCandidate>> {
+    apply_network_locality(cfg, dry_run)?;
+
+    if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
+        let prepared = prepare_builtin_scheduler_runtime(cfg)?;
+        info!(
+            "builtin scheduler intent prepared: ops={} queues={} tasks={}",
+            read_sched_ext_ops(),
+            prepared.intent.queues.len(),
+            prepared.intent.tasks.len()
+        );
+        if dry_run {
+            print!("{}", describe_landscape_scheduler_intent(&prepared.intent));
+        } else {
+            ensure_landscape_scheduler_with_fallback(cfg, &prepared.intent)?;
+        }
+
+        apply_builtin_switch_to_candidates(cfg, &prepared.intent, &prepared.selected, dry_run)?;
+        Ok(prepared.candidates)
+    } else {
+        let list = discover_agent_candidates(cfg)?;
+        apply_partial_switch_to_candidates(cfg, &list, dry_run)?;
+        Ok(list)
+    }
+}
+
+fn wait_for_reconcile_trigger(
+    cfg: &ScxConfig,
+    candidates: &[ThreadCandidate],
+) -> Result<ReconcileTrigger> {
+    let interval = Duration::from_secs(cfg.agent.apply_interval_secs);
+    let Some(mut watcher) = ReconcileWatcher::new(cfg, candidates)? else {
+        thread::sleep(interval);
+        return Ok(ReconcileTrigger::Interval);
+    };
+
+    watcher.wait(interval)
+}
+
+fn collect_reconcile_watch_targets(
+    cfg: &ScxConfig,
+    candidates: &[ThreadCandidate],
+) -> Vec<ReconcileWatchTarget> {
+    let mut targets = BTreeMap::<PathBuf, u32>::new();
+
+    for prefix in &cfg.discovery.cgroup_prefixes {
+        insert_cgroup_watch_targets(&mut targets, prefix);
+    }
+
+    let mut userspace_pids = BTreeSet::new();
+    let mut discovered_cgroup_paths = BTreeSet::new();
+    for candidate in candidates {
+        if parse_ksoftirqd_cpu(&candidate.comm).is_some() {
+            continue;
+        }
+
+        userspace_pids.insert(candidate.pid);
+        for cgroup_path in parse_proc_cgroup_paths(&candidate.cgroup) {
+            if cgroup_path != "/" {
+                discovered_cgroup_paths.insert(cgroup_path);
+            }
+        }
+    }
+
+    for cgroup_path in discovered_cgroup_paths {
+        insert_cgroup_watch_targets(&mut targets, &cgroup_path);
+    }
+
+    for pid in userspace_pids {
+        insert_watch_target(
+            &mut targets,
+            PathBuf::from(format!("/proc/{pid}/task")),
+            libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_FROM
+                | libc::IN_MOVED_TO
+                | libc::IN_DELETE_SELF
+                | libc::IN_MOVE_SELF,
+        );
+    }
+
+    if cfg.discovery.cgroup_prefixes.is_empty() {
+        insert_watch_target(
+            &mut targets,
+            PathBuf::from("/proc"),
+            libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
+        );
+    }
+
+    targets.into_iter().map(|(path, mask)| ReconcileWatchTarget { path, mask }).collect()
+}
+
+fn insert_cgroup_watch_targets(targets: &mut BTreeMap<PathBuf, u32>, cgroup_path: &str) {
+    let dir_path = cgroup_fs_path(cgroup_path);
+    insert_watch_target(
+        targets,
+        dir_path.clone(),
+        libc::IN_CREATE
+            | libc::IN_DELETE
+            | libc::IN_MOVED_FROM
+            | libc::IN_MOVED_TO
+            | libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF,
+    );
+    insert_watch_target(
+        targets,
+        dir_path.join("cgroup.procs"),
+        libc::IN_MODIFY
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_ATTRIB
+            | libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF,
+    );
+}
+
+fn insert_watch_target(targets: &mut BTreeMap<PathBuf, u32>, path: PathBuf, mask: u32) {
+    targets.entry(path).and_modify(|existing| *existing |= mask).or_insert(mask);
+}
+
+fn cgroup_fs_path(cgroup_path: &str) -> PathBuf {
+    let trimmed = cgroup_path.trim();
+    let relative = trimmed.trim_start_matches('/');
+    if relative.is_empty() {
+        PathBuf::from("/sys/fs/cgroup")
+    } else {
+        Path::new("/sys/fs/cgroup").join(relative)
+    }
+}
+
+fn parse_proc_cgroup_paths(raw: &str) -> BTreeSet<String> {
+    raw.lines()
+        .filter_map(|line| line.rsplit(':').next())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn poll_timeout_ms(duration: Duration) -> i32 {
+    let millis = duration.as_millis();
+    millis.min(i32::MAX as u128) as i32
 }
 
 fn print_network_status(cfg: &ScxConfig) -> Result<()> {
@@ -539,9 +864,7 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
 
 fn health(config: PathBuf) -> Result<()> {
     let cfg = load_or_default(config)?;
-    let self_pid = std::process::id() as i32;
-    let list: Vec<_> =
-        discover_candidates(&cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
+    let list = discover_agent_candidates(&cfg)?;
 
     let state = std::fs::read_to_string("/sys/kernel/sched_ext/state")
         .unwrap_or_else(|_| "unknown".to_string());
@@ -584,32 +907,6 @@ fn health(config: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn apply_partial_switch(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
-    let self_pid = std::process::id() as i32;
-    let list: Vec<_> =
-        discover_candidates(cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
-
-    apply_partial_switch_to_candidates(cfg, &list, dry_run)
-}
-
-fn run_custom_bpf_cycle(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
-    let prepared = prepare_builtin_scheduler_runtime(cfg)?;
-
-    info!(
-        "builtin scheduler intent prepared: ops={} queues={} tasks={}",
-        read_sched_ext_ops(),
-        prepared.intent.queues.len(),
-        prepared.intent.tasks.len()
-    );
-    if dry_run {
-        print!("{}", describe_landscape_scheduler_intent(&prepared.intent));
-    } else {
-        ensure_landscape_scheduler_with_fallback(cfg, &prepared.intent)?;
-    }
-
-    apply_builtin_switch_to_candidates(cfg, &prepared.intent, &prepared.selected, dry_run)
-}
-
 #[derive(Debug, Clone)]
 struct BuiltinSchedulerPrepared {
     candidates: Vec<ThreadCandidate>,
@@ -618,9 +915,7 @@ struct BuiltinSchedulerPrepared {
 }
 
 fn prepare_builtin_scheduler_runtime(cfg: &ScxConfig) -> Result<BuiltinSchedulerPrepared> {
-    let self_pid = std::process::id() as i32;
-    let candidates: Vec<_> =
-        discover_candidates(cfg)?.into_iter().filter(|c| c.pid != self_pid).collect();
+    let candidates = discover_agent_candidates(cfg)?;
     let plans = build_network_locality_plans(cfg)?;
     let intent = build_landscape_scheduler_intent(cfg, &plans, &candidates);
     let selected = select_builtin_scheduler_candidates(&intent, &candidates);
@@ -1068,8 +1363,8 @@ fn load_or_default(path: PathBuf) -> Result<ScxConfig> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_landscape_scheduler_intent, builtin_task_policy_action, thread_policy_action,
-        ScxConfig, ThreadCpuClass,
+        build_landscape_scheduler_intent, builtin_task_policy_action,
+        collect_reconcile_watch_targets, thread_policy_action, ScxConfig, ThreadCpuClass,
     };
     use landscape_scx_common::{
         InterfaceLocalityPlan, InterfaceLocalityStatus, LandscapeTaskIntent, LandscapeTaskKind,
@@ -1282,6 +1577,54 @@ mod tests {
         assert_eq!(action.cpus, vec![11]);
         assert!(action.apply_sched_ext);
         assert!(action.apply_affinity);
+    }
+
+    #[test]
+    fn reconcile_watch_targets_include_cgroup_and_task_paths() {
+        let mut cfg = ScxConfig::default();
+        cfg.discovery.cgroup_prefixes = vec!["/system.slice/landscape-router.service".into()];
+
+        let targets = collect_reconcile_watch_targets(
+            &cfg,
+            &[ThreadCandidate {
+                pid: 5910,
+                tid: 5915,
+                start_time_ns: 123,
+                comm: "tokio-runtime-w".into(),
+                cmdline: "/root/landscape-webserver".into(),
+                cgroup: "0::/system.slice/landscape-router.service/dataplane".into(),
+            }],
+        );
+        let target_paths = targets
+            .into_iter()
+            .map(|target| target.path)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(target_paths.contains(&std::path::PathBuf::from("/proc/5910/task")));
+        assert!(target_paths.contains(&std::path::PathBuf::from(
+            "/sys/fs/cgroup/system.slice/landscape-router.service"
+        )));
+        assert!(target_paths.contains(&std::path::PathBuf::from(
+            "/sys/fs/cgroup/system.slice/landscape-router.service/cgroup.procs"
+        )));
+        assert!(target_paths.contains(&std::path::PathBuf::from(
+            "/sys/fs/cgroup/system.slice/landscape-router.service/dataplane"
+        )));
+        assert!(target_paths.contains(&std::path::PathBuf::from(
+            "/sys/fs/cgroup/system.slice/landscape-router.service/dataplane/cgroup.procs"
+        )));
+    }
+
+    #[test]
+    fn reconcile_watch_targets_fallback_to_proc_without_cgroup_scope() {
+        let cfg = ScxConfig::default();
+        let targets = collect_reconcile_watch_targets(&cfg, &[]);
+        let target_paths = targets
+            .into_iter()
+            .map(|target| target.path)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(target_paths.contains(&std::path::PathBuf::from("/proc")));
     }
 
     #[test]

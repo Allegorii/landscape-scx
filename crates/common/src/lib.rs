@@ -193,6 +193,10 @@ pub struct CustomBpfSchedulerConfig {
 pub struct AgentConfig {
     #[serde(default = "default_apply_interval_secs")]
     pub apply_interval_secs: u64,
+    #[serde(default = "default_event_driven")]
+    pub event_driven: bool,
+    #[serde(default = "default_event_debounce_ms")]
+    pub event_debounce_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,7 +317,11 @@ impl Default for CustomBpfSchedulerConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { apply_interval_secs: default_apply_interval_secs() }
+        Self {
+            apply_interval_secs: default_apply_interval_secs(),
+            event_driven: default_event_driven(),
+            event_debounce_ms: default_event_debounce_ms(),
+        }
     }
 }
 
@@ -395,7 +403,15 @@ const fn default_fallback_on_error() -> bool {
 }
 
 const fn default_apply_interval_secs() -> u64 {
-    10
+    5
+}
+
+const fn default_event_driven() -> bool {
+    true
+}
+
+const fn default_event_debounce_ms() -> u64 {
+    250
 }
 
 fn default_queue_mapping_mode() -> QueueMappingMode {
@@ -1898,7 +1914,11 @@ mod tests {
                 fallback_on_error: false,
                 custom_bpf: CustomBpfSchedulerConfig::default(),
             },
-            agent: super::AgentConfig { apply_interval_secs: 10 },
+            agent: super::AgentConfig {
+                apply_interval_secs: 5,
+                event_driven: true,
+                event_debounce_ms: 250,
+            },
         }
     }
 

@@ -48,6 +48,14 @@ cargo check
 
 `sudo cargo run -p landscape-scx-agent -- run --config ./configs/landscape-scx.toml`
 
+The agent now reconciles in two ways:
+
+- event-driven fast path: watches configured `cgroup.procs` files and current
+  `/proc/<pid>/task` directories so service restarts, PPPoE re-dial, and thread
+  churn are picked up quickly
+- timed fallback: keeps `agent.apply_interval_secs` as a safety reconcile in
+  case events are missed
+
 ## Thread-Class CPU placement
 
 You can pin different thread groups to different CPU sets by prefix matching,
@@ -212,6 +220,25 @@ Current limitations:
 
 The stable path remains `mode = "external_command"`. Use `custom_bpf` only when
 you explicitly want to iterate on the built-in queue-island scheduler.
+
+## Agent reconcile loop
+
+```toml
+[agent]
+apply_interval_secs = 5
+event_driven = true
+event_debounce_ms = 250
+```
+
+- `apply_interval_secs`: periodic fallback reconcile cadence
+- `event_driven`: enable the inotify-based fast path
+- `event_debounce_ms`: coalesce bursts of `cgroup.procs` / `/proc/<pid>/task`
+  events before one reconcile pass
+
+When `discovery.cgroup_prefixes` is set, the agent also watches those cgroup
+directories directly. That makes it a good fit for layouts such as
+`landscape-router.service/.../dataplane`, where new dataplane threads should be
+attached as soon as they enter the scoped cgroup tree.
 
 ## Integration With Landscape
 
