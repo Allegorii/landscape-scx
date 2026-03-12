@@ -18,9 +18,11 @@ const QID_OWNER_MAP_NAME: &str = "qid_owner_map";
 const TASK_CTX_MAP_NAME: &str = "task_ctx_map";
 const HOUSEKEEPING_CPU_MAP_NAME: &str = "housekeeping_cpu_map";
 const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "housekeeping_default_cpu_map";
+const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct LandscapeSchedulerStaticState {
+    schema_version: u32,
     switch_mode: ScxSwitchMode,
 }
 
@@ -219,11 +221,15 @@ pub fn ensure_landscape_scheduler(
     fs::create_dir_all(&paths.link_dir)
         .with_context(|| format!("failed to create {}", paths.link_dir.display()))?;
 
-    let runtime_state = LandscapeSchedulerStaticState { switch_mode: intent.switch_mode.clone() };
+    let runtime_state = LandscapeSchedulerStaticState {
+        schema_version: LANDSCAPE_SCHEDULER_SCHEMA_VERSION,
+        switch_mode: intent.switch_mode.clone(),
+    };
     let previous_intent =
         read_intent_state(&paths.intent_state_path).and_then(|raw| toml::from_str(&raw).ok());
     let needs_reload = read_runtime_state(&paths.runtime_state_path).as_ref()
         != Some(&runtime_state)
+        || !builtin_map_pins_ready(&paths)
         || read_sched_ext_ops() != "landscape_scx"
         || !sched_ext_enabled();
 
@@ -780,6 +786,13 @@ fn hex_byte_args(bytes: &[u8]) -> Vec<String> {
 
 fn builtin_map_dir(paths: &BuiltinSchedulerPaths) -> PathBuf {
     paths.link_dir.join("maps")
+}
+
+fn builtin_map_pins_ready(paths: &BuiltinSchedulerPaths) -> bool {
+    builtin_qid_owner_map_path(paths).exists()
+        && builtin_task_ctx_map_path(paths).exists()
+        && builtin_housekeeping_cpu_map_path(paths).exists()
+        && builtin_housekeeping_default_cpu_map_path(paths).exists()
 }
 
 fn builtin_qid_owner_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
