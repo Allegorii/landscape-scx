@@ -83,6 +83,8 @@ pub struct NetworkConfig {
     pub queue_mapping_mode: QueueMappingMode,
     #[serde(default = "default_xps_mode")]
     pub xps_mode: XpsMode,
+    #[serde(default = "default_rps_mode")]
+    pub rps_mode: RpsMode,
     #[serde(default)]
     pub active_queue_count: usize,
 }
@@ -111,6 +113,8 @@ pub struct NetworkInterfacePolicy {
     pub queue_mapping_mode: Option<QueueMappingMode>,
     #[serde(default)]
     pub xps_mode: Option<XpsMode>,
+    #[serde(default)]
+    pub rps_mode: Option<RpsMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,8 +127,17 @@ pub enum QueueMappingMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum XpsMode {
+    Auto,
     Cpus,
     Rxqs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RpsMode {
+    Auto,
+    Off,
+    Preserve,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +328,7 @@ impl Default for NetworkConfig {
             clear_inactive_xps: false,
             queue_mapping_mode: default_queue_mapping_mode(),
             xps_mode: default_xps_mode(),
+            rps_mode: default_rps_mode(),
             active_queue_count: 0,
         }
     }
@@ -389,7 +403,11 @@ fn default_queue_mapping_mode() -> QueueMappingMode {
 }
 
 fn default_xps_mode() -> XpsMode {
-    XpsMode::Cpus
+    XpsMode::Auto
+}
+
+fn default_rps_mode() -> RpsMode {
+    RpsMode::Auto
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<ScxConfig> {
@@ -707,6 +725,7 @@ pub struct InterfaceLocalityPlan {
     pub forwarding_cpus: Vec<usize>,
     pub queue_mapping_mode: QueueMappingMode,
     pub xps_mode: XpsMode,
+    pub rps_mode: RpsMode,
     pub apply_rss_equal: bool,
     pub apply_combined_channels: bool,
     pub clear_inactive_xps: bool,
@@ -718,6 +737,7 @@ pub struct InterfaceLocalityPlan {
     pub channel_action: Option<ChannelAction>,
     pub rss_action: Option<RssEqualAction>,
     pub xps_actions: Vec<XpsAction>,
+    pub rps_actions: Vec<RpsAction>,
     pub inactive_xps_actions: Vec<XpsAction>,
     pub irq_actions: Vec<IrqAffinityAction>,
 }
@@ -730,6 +750,16 @@ pub struct XpsAction {
     pub mode: XpsMode,
     pub indices: Vec<usize>,
     pub mask: String,
+    pub current_value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RpsAction {
+    pub interface: String,
+    pub queue_name: String,
+    pub path: PathBuf,
+    pub mask: String,
+    pub indices: Vec<usize>,
     pub current_value: String,
 }
 
@@ -754,7 +784,9 @@ struct ResolvedNetworkInterface {
     apply_combined_channels: bool,
     clear_inactive_xps: bool,
     queue_mapping_mode: QueueMappingMode,
+    requested_xps_mode: XpsMode,
     xps_mode: XpsMode,
+    rps_mode: RpsMode,
 }
 
 #[derive(Debug, Clone)]
@@ -786,57 +818,173 @@ pub struct RssEqualAction {
 }
 
 impl NetworkInterfaceSpec {
-    fn resolve(&self, network: &NetworkConfig, policy: &PolicyConfig) -> ResolvedNetworkInterface {
+    fn resolve(&self, cfg: &ScxConfig) -> ResolvedNetworkInterface {
+        let network = &cfg.network;
+        let policy = &cfg.policy;
         match self {
-            NetworkInterfaceSpec::Name(name) => ResolvedNetworkInterface {
-                name: name.clone(),
-                forwarding_cpus: policy.forwarding_cpus.clone(),
-                active_queue_count: network.active_queue_count,
-                apply_rss_equal: network.apply_rss_equal,
-                apply_combined_channels: network.apply_combined_channels,
-                clear_inactive_xps: network.clear_inactive_xps,
-                queue_mapping_mode: network.queue_mapping_mode.clone(),
-                xps_mode: network.xps_mode.clone(),
-            },
-            NetworkInterfaceSpec::Config(cfg) => ResolvedNetworkInterface {
-                name: cfg.name.clone(),
-                forwarding_cpus: if cfg.forwarding_cpus.is_empty() {
-                    policy.forwarding_cpus.clone()
-                } else {
-                    cfg.forwarding_cpus.clone()
-                },
-                active_queue_count: if cfg.active_queue_count == 0 {
-                    network.active_queue_count
-                } else {
-                    cfg.active_queue_count
-                },
-                apply_rss_equal: cfg.apply_rss_equal.unwrap_or(network.apply_rss_equal),
-                apply_combined_channels: cfg
-                    .apply_combined_channels
-                    .unwrap_or(network.apply_combined_channels),
-                clear_inactive_xps: cfg.clear_inactive_xps.unwrap_or(network.clear_inactive_xps),
-                queue_mapping_mode: cfg
-                    .queue_mapping_mode
-                    .clone()
-                    .unwrap_or_else(|| network.queue_mapping_mode.clone()),
-                xps_mode: cfg.xps_mode.clone().unwrap_or_else(|| network.xps_mode.clone()),
-            },
+            NetworkInterfaceSpec::Name(name) => {
+                let mut resolved = ResolvedNetworkInterface {
+                    name: name.clone(),
+                    forwarding_cpus: policy.forwarding_cpus.clone(),
+                    active_queue_count: network.active_queue_count,
+                    apply_rss_equal: network.apply_rss_equal,
+                    apply_combined_channels: network.apply_combined_channels,
+                    clear_inactive_xps: network.clear_inactive_xps,
+                    queue_mapping_mode: network.queue_mapping_mode.clone(),
+                    requested_xps_mode: network.xps_mode.clone(),
+                    xps_mode: network.xps_mode.clone(),
+                    rps_mode: network.rps_mode.clone(),
+                };
+                resolved.xps_mode = effective_xps_mode(cfg, &resolved);
+                resolved
+            }
+            NetworkInterfaceSpec::Config(iface_cfg) => {
+                let mut resolved = ResolvedNetworkInterface {
+                    name: iface_cfg.name.clone(),
+                    forwarding_cpus: if iface_cfg.forwarding_cpus.is_empty() {
+                        policy.forwarding_cpus.clone()
+                    } else {
+                        iface_cfg.forwarding_cpus.clone()
+                    },
+                    active_queue_count: if iface_cfg.active_queue_count == 0 {
+                        network.active_queue_count
+                    } else {
+                        iface_cfg.active_queue_count
+                    },
+                    apply_rss_equal: iface_cfg.apply_rss_equal.unwrap_or(network.apply_rss_equal),
+                    apply_combined_channels: iface_cfg
+                        .apply_combined_channels
+                        .unwrap_or(network.apply_combined_channels),
+                    clear_inactive_xps: iface_cfg
+                        .clear_inactive_xps
+                        .unwrap_or(network.clear_inactive_xps),
+                    queue_mapping_mode: iface_cfg
+                        .queue_mapping_mode
+                        .clone()
+                        .unwrap_or_else(|| network.queue_mapping_mode.clone()),
+                    requested_xps_mode: iface_cfg
+                        .xps_mode
+                        .clone()
+                        .unwrap_or_else(|| network.xps_mode.clone()),
+                    xps_mode: iface_cfg
+                        .xps_mode
+                        .clone()
+                        .unwrap_or_else(|| network.xps_mode.clone()),
+                    rps_mode: iface_cfg
+                        .rps_mode
+                        .clone()
+                        .unwrap_or_else(|| network.rps_mode.clone()),
+                };
+                resolved.xps_mode = effective_xps_mode(cfg, &resolved);
+                resolved
+            }
         }
     }
 }
 
 fn resolved_network_interfaces(cfg: &ScxConfig) -> Vec<ResolvedNetworkInterface> {
-    cfg.network.interfaces.iter().map(|iface| iface.resolve(&cfg.network, &cfg.policy)).collect()
+    cfg.network.interfaces.iter().map(|iface| iface.resolve(cfg)).collect()
+}
+
+fn effective_xps_mode(cfg: &ScxConfig, iface: &ResolvedNetworkInterface) -> XpsMode {
+    match iface.requested_xps_mode {
+        XpsMode::Cpus | XpsMode::Rxqs => iface.requested_xps_mode.clone(),
+        XpsMode::Auto => {
+            if strict_forwarding_thread_pinning(cfg) {
+                XpsMode::Cpus
+            } else {
+                XpsMode::Rxqs
+            }
+        }
+    }
+}
+
+fn adapt_xps_mode_to_interface_support(
+    mut iface: ResolvedNetworkInterface,
+    status: &InterfaceLocalityStatus,
+) -> ResolvedNetworkInterface {
+    if !matches!(iface.requested_xps_mode, XpsMode::Auto) {
+        return iface;
+    }
+
+    iface.xps_mode = match iface.xps_mode {
+        XpsMode::Rxqs if status.tx_xps_rxqs.is_empty() && !status.tx_xps_cpus.is_empty() => {
+            XpsMode::Cpus
+        }
+        XpsMode::Cpus if status.tx_xps_cpus.is_empty() && !status.tx_xps_rxqs.is_empty() => {
+            XpsMode::Rxqs
+        }
+        mode => mode,
+    };
+    iface
+}
+
+fn strict_forwarding_thread_pinning(cfg: &ScxConfig) -> bool {
+    if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
+        return true;
+    }
+
+    let mut saw_forwarding_class = false;
+    for class in &cfg.policy.thread_cpu_classes {
+        if !looks_like_forwarding_prefix(&class.thread_name_prefix) {
+            continue;
+        }
+        saw_forwarding_class = true;
+        if !class.apply_affinity.unwrap_or(true) || class.cpus.len() != 1 {
+            return false;
+        }
+    }
+
+    saw_forwarding_class
+}
+
+fn looks_like_forwarding_prefix(prefix: &str) -> bool {
+    matches!(prefix, "pppd" | "landscape-forwarder")
+        || prefix.starts_with("landscape_pppoe")
+        || prefix.starts_with("pppoe-rx-")
+}
+
+fn physical_core_capacity(cpus: &[usize]) -> usize {
+    let mut unique_cores = BTreeSet::new();
+
+    for cpu in cpus {
+        let siblings = read_cpu_thread_siblings(*cpu).unwrap_or_else(|_| {
+            let mut out = BTreeSet::new();
+            out.insert(*cpu);
+            out
+        });
+        let canonical =
+            siblings.into_iter().map(|entry| entry.to_string()).collect::<Vec<_>>().join(",");
+        unique_cores.insert(canonical);
+    }
+
+    unique_cores.len().max(1)
+}
+
+fn read_cpu_thread_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
+    let path =
+        PathBuf::from(format!("/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list", cpu));
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read cpu topology siblings from {}", path.display()))?;
+    parse_cpu_list(raw.trim())
 }
 
 pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLocalityPlan>> {
     let mut plans = Vec::new();
 
     for iface in resolved_network_interfaces(cfg) {
-        let status = read_interface_locality_status(&iface)?;
+        let initial_mode = iface.xps_mode.clone();
+        let initial_status = read_interface_locality_status(&iface)?;
+        let iface = adapt_xps_mode_to_interface_support(iface, &initial_status);
+        let status = if iface.xps_mode == initial_mode {
+            initial_status
+        } else {
+            read_interface_locality_status(&iface)?
+        };
         let active_queue_count = effective_active_queue_count(cfg, &iface, &status)?;
         let channel_action = build_channel_action(&iface, &status, active_queue_count)?;
         let rss_action = build_rss_equal_action(&iface, &status, active_queue_count)?;
+        let rps_actions = build_interface_rps_actions(&iface, &status, active_queue_count)?;
         let xps_actions = if cfg.network.apply_xps {
             build_interface_xps_actions(&iface, &status, active_queue_count)?
         } else {
@@ -858,6 +1006,7 @@ pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLoca
             forwarding_cpus: iface.forwarding_cpus.clone(),
             queue_mapping_mode: iface.queue_mapping_mode.clone(),
             xps_mode: iface.xps_mode.clone(),
+            rps_mode: iface.rps_mode.clone(),
             apply_rss_equal: iface.apply_rss_equal,
             apply_combined_channels: iface.apply_combined_channels,
             clear_inactive_xps: iface.clear_inactive_xps,
@@ -869,6 +1018,7 @@ pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLoca
             rss_action,
             status,
             xps_actions,
+            rps_actions,
             inactive_xps_actions,
             irq_actions,
         });
@@ -900,7 +1050,7 @@ fn read_interface_locality_status(
         } else {
             None
         },
-        rss_status: if iface.apply_rss_equal {
+        rss_status: if iface.apply_rss_equal || matches!(iface.rps_mode, RpsMode::Auto) {
             Some(read_ethtool_rss_status(&iface.name)?)
         } else {
             None
@@ -927,6 +1077,24 @@ fn run_ethtool(args: &[&str]) -> Result<String> {
         format!("exit status {}", output.status)
     };
     anyhow::bail!("ethtool {} failed: {}", args.join(" "), details);
+}
+
+pub fn irqbalance_conflicts(cfg: &ScxConfig) -> bool {
+    cfg.network.apply_irq_affinity && irqbalance_active()
+}
+
+pub fn irqbalance_active() -> bool {
+    if let Ok(output) = Command::new("systemctl").args(["is-active", "irqbalance"]).output() {
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "active" {
+            return true;
+        }
+    }
+
+    Command::new("pgrep")
+        .args(["-x", "irqbalance"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn parse_ethtool_channels_status(raw: &str) -> Result<ChannelStatus> {
@@ -1068,6 +1236,41 @@ fn build_rss_equal_action(
     }))
 }
 
+fn build_interface_rps_actions(
+    iface: &ResolvedNetworkInterface,
+    status: &InterfaceLocalityStatus,
+    active_queue_count: usize,
+) -> Result<Vec<RpsAction>> {
+    let should_disable = match iface.rps_mode {
+        RpsMode::Preserve => false,
+        RpsMode::Off => true,
+        RpsMode::Auto => {
+            let Some(rss_status) = &status.rss_status else {
+                return Ok(Vec::new());
+            };
+            rss_status.ring_count == active_queue_count
+                && rss_equal_matches(&rss_status.used_queues, active_queue_count)
+        }
+    };
+
+    if !should_disable {
+        return Ok(Vec::new());
+    }
+
+    Ok(status
+        .rx_queues
+        .iter()
+        .map(|queue| RpsAction {
+            interface: status.interface.clone(),
+            queue_name: queue.name.clone(),
+            path: queue.path.clone(),
+            mask: "0".to_string(),
+            indices: Vec::new(),
+            current_value: queue.value.clone(),
+        })
+        .collect())
+}
+
 fn effective_active_queue_count(
     cfg: &ScxConfig,
     iface: &ResolvedNetworkInterface,
@@ -1097,7 +1300,8 @@ fn effective_active_queue_count(
     };
 
     if iface.active_queue_count == 0 {
-        return Ok(available);
+        let physical_capacity = physical_core_capacity(&iface.forwarding_cpus);
+        return Ok(available.min(physical_capacity));
     }
 
     if iface.active_queue_count > available {
@@ -1120,6 +1324,7 @@ fn effective_active_queue_count(
 
 fn status_tx_queue_count(status: &InterfaceLocalityStatus, xps_mode: &XpsMode) -> usize {
     match xps_mode {
+        XpsMode::Auto => status.tx_xps_cpus.len(),
         XpsMode::Cpus => status.tx_xps_cpus.len(),
         XpsMode::Rxqs => status.tx_xps_rxqs.len(),
     }
@@ -1219,6 +1424,7 @@ fn build_interface_xps_actions(
     active_queue_count: usize,
 ) -> Result<Vec<XpsAction>> {
     let queues = match iface.xps_mode {
+        XpsMode::Auto => &status.tx_xps_cpus,
         XpsMode::Cpus => &status.tx_xps_cpus,
         XpsMode::Rxqs => &status.tx_xps_rxqs,
     };
@@ -1233,6 +1439,9 @@ fn build_interface_xps_actions(
     let mut out = Vec::new();
     for (ordinal, queue) in queues.iter().take(active_queue_count).enumerate() {
         let indices = match iface.xps_mode {
+            XpsMode::Auto => {
+                desired_locality_cpus(&iface.forwarding_cpus, &iface.queue_mapping_mode, ordinal)
+            }
             XpsMode::Cpus => {
                 desired_locality_cpus(&iface.forwarding_cpus, &iface.queue_mapping_mode, ordinal)
             }
@@ -1458,6 +1667,10 @@ pub fn write_xps_cpus(action: &XpsAction) -> Result<()> {
     write_trimmed(&action.path, &action.mask)
 }
 
+pub fn write_rps_cpus(action: &RpsAction) -> Result<()> {
+    write_trimmed(&action.path, &action.mask)
+}
+
 pub fn apply_ethtool_combined_channels(action: &ChannelAction) -> Result<()> {
     let output = Command::new("ethtool")
         .args(["-L", &action.interface, "combined", &action.expected_combined.to_string()])
@@ -1637,11 +1850,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        affinity_list_matches, cpu_list_string, cpu_mask_string, matches_target, parse_cpu_mask,
+        affinity_list_matches, build_interface_rps_actions, cpu_list_string, cpu_mask_string,
+        effective_active_queue_count, matches_target, parse_cpu_mask,
         parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
         parse_ksoftirqd_cpu, resolved_network_interfaces, rss_equal_matches, xps_mask_matches,
-        CustomBpfSchedulerConfig, DiscoveryConfig, NetworkConfig, PolicyConfig, QueueMappingMode,
-        SchedulerConfig, SchedulerMode, ScxConfig, ScxSwitchMode, XpsMode,
+        ChannelStatus, CustomBpfSchedulerConfig, DiscoveryConfig, InterfaceLocalityStatus,
+        NetworkConfig, PolicyConfig, QueueLocalityState, QueueMappingMode,
+        ResolvedNetworkInterface, RpsMode, RssStatus, SchedulerConfig, SchedulerMode, ScxConfig,
+        ScxSwitchMode, ThreadCpuClass, XpsMode,
     };
 
     fn test_config() -> ScxConfig {
@@ -1669,7 +1885,8 @@ mod tests {
                 apply_combined_channels: false,
                 clear_inactive_xps: false,
                 queue_mapping_mode: QueueMappingMode::RoundRobin,
-                xps_mode: XpsMode::Cpus,
+                xps_mode: XpsMode::Auto,
+                rps_mode: RpsMode::Auto,
                 active_queue_count: 0,
             },
             scheduler: SchedulerConfig {
@@ -1844,6 +2061,110 @@ dead:beef
         assert_eq!(status.used_queues, vec![0, 1, 2, 3, 4, 5, 6, 7]);
         assert!(rss_equal_matches(&status.used_queues, 8));
         assert!(!rss_equal_matches(&status.used_queues, 4));
+    }
+
+    #[test]
+    fn auto_xps_mode_prefers_cpus_for_custom_bpf_scheduler() {
+        let mut cfg = test_config();
+        cfg.scheduler.mode = SchedulerMode::CustomBpf;
+        cfg.network.interfaces = vec![super::NetworkInterfaceSpec::Name("eth0".into())];
+
+        let resolved = resolved_network_interfaces(&cfg);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].requested_xps_mode, XpsMode::Auto);
+        assert_eq!(resolved[0].xps_mode, XpsMode::Cpus);
+    }
+
+    #[test]
+    fn auto_xps_mode_prefers_rxqs_without_strict_forwarder_pinning() {
+        let mut cfg = test_config();
+        cfg.network.interfaces = vec![super::NetworkInterfaceSpec::Name("eth0".into())];
+        cfg.policy.thread_cpu_classes = vec![ThreadCpuClass {
+            thread_name_prefix: "pppd".into(),
+            cpus: vec![0, 1],
+            apply_sched_ext: Some(true),
+            apply_affinity: Some(true),
+        }];
+
+        let resolved = resolved_network_interfaces(&cfg);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].requested_xps_mode, XpsMode::Auto);
+        assert_eq!(resolved[0].xps_mode, XpsMode::Rxqs);
+    }
+
+    #[test]
+    fn active_queue_count_auto_caps_to_physical_core_capacity() {
+        let cfg = test_config();
+        let iface = ResolvedNetworkInterface {
+            name: "eth0".into(),
+            forwarding_cpus: vec![9000, 9001, 9002],
+            active_queue_count: 0,
+            apply_rss_equal: false,
+            apply_combined_channels: false,
+            clear_inactive_xps: false,
+            queue_mapping_mode: QueueMappingMode::RoundRobin,
+            requested_xps_mode: XpsMode::Auto,
+            xps_mode: XpsMode::Cpus,
+            rps_mode: RpsMode::Auto,
+        };
+        let status = InterfaceLocalityStatus {
+            interface: "eth0".into(),
+            tx_xps_cpus: (0..8)
+                .map(|idx| QueueLocalityState {
+                    name: format!("tx-{idx}"),
+                    path: PathBuf::from(format!("/tmp/tx-{idx}")),
+                    value: "0".into(),
+                })
+                .collect(),
+            tx_xps_rxqs: Vec::new(),
+            rx_queues: Vec::new(),
+            irqs: Vec::new(),
+            channel_status: None,
+            rss_status: None,
+        };
+
+        let active = effective_active_queue_count(&cfg, &iface, &status).unwrap();
+        assert_eq!(active, 3);
+    }
+
+    #[test]
+    fn auto_rps_mode_disables_rps_when_rss_is_aligned() {
+        let iface = ResolvedNetworkInterface {
+            name: "eth0".into(),
+            forwarding_cpus: vec![0, 1],
+            active_queue_count: 0,
+            apply_rss_equal: true,
+            apply_combined_channels: false,
+            clear_inactive_xps: false,
+            queue_mapping_mode: QueueMappingMode::RoundRobin,
+            requested_xps_mode: XpsMode::Auto,
+            xps_mode: XpsMode::Cpus,
+            rps_mode: RpsMode::Auto,
+        };
+        let status = InterfaceLocalityStatus {
+            interface: "eth0".into(),
+            tx_xps_cpus: Vec::new(),
+            tx_xps_rxqs: Vec::new(),
+            rx_queues: vec![
+                QueueLocalityState {
+                    name: "rx-0".into(),
+                    path: PathBuf::from("/tmp/rx-0"),
+                    value: "3".into(),
+                },
+                QueueLocalityState {
+                    name: "rx-1".into(),
+                    path: PathBuf::from("/tmp/rx-1"),
+                    value: "c".into(),
+                },
+            ],
+            irqs: Vec::new(),
+            channel_status: Some(ChannelStatus { max_combined: 8, current_combined: 2 }),
+            rss_status: Some(RssStatus { ring_count: 2, used_queues: vec![0, 1] }),
+        };
+
+        let actions = build_interface_rps_actions(&iface, &status, 2).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|action| action.mask == "0"));
     }
 
     #[test]

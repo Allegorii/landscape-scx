@@ -13,11 +13,11 @@ use landscape_scx_bpf::{
 use landscape_scx_common::{
     affinity_list_matches, apply_ethtool_combined_channels, apply_ethtool_rss_equal,
     build_network_locality_plans, desired_locality_cpus, discover_candidates, get_sched_policy,
-    load_config, parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches, sched_policy_name,
-    try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config, write_irq_affinity,
-    write_xps_cpus, xps_mask_matches, InterfaceLocalityPlan, LandscapeQueueIntent,
-    LandscapeSchedulerIntent, LandscapeTaskIntent, LandscapeTaskKind, SchedulerMode, ScxConfig,
-    ThreadCandidate, ThreadCpuClass, LANDSCAPE_DSQ_BASE,
+    irqbalance_conflicts, load_config, parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches,
+    sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config,
+    write_irq_affinity, write_rps_cpus, write_xps_cpus, xps_mask_matches, InterfaceLocalityPlan,
+    LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskIntent, LandscapeTaskKind,
+    SchedulerMode, ScxConfig, ThreadCandidate, ThreadCpuClass, LANDSCAPE_DSQ_BASE,
 };
 use tracing::{error, info, warn};
 
@@ -139,6 +139,9 @@ fn validate(config: PathBuf) -> Result<()> {
     let cfg = load_or_default(config)?;
     validate_cpu_config(&cfg)?;
     validate_custom_bpf_runtime(&cfg.scheduler)?;
+    if irqbalance_conflicts(&cfg) {
+        warn!("irqbalance is active while network.apply_irq_affinity=true; it may overwrite manual IRQ affinity");
+    }
     let online = read_online_cpus()?;
     info!("config validation passed; online_cpus={:?}", online);
     Ok(())
@@ -175,13 +178,17 @@ fn print_network_status(cfg: &ScxConfig) -> Result<()> {
     }
 
     println!("network_locality:");
+    if irqbalance_conflicts(cfg) {
+        println!("irqbalance=active status=warning");
+    }
     for plan in plans {
         println!(
-            "iface={} forwarding_cpus={} queue_mapping_mode={:?} xps_mode={:?} active_queues={}/{} irqs={}/{} rxqs={}/{}",
+            "iface={} forwarding_cpus={} queue_mapping_mode={:?} xps_mode={:?} rps_mode={:?} active_queues={}/{} irqs={}/{} rxqs={}/{}",
             plan.interface,
             landscape_scx_common::cpu_list_string(&plan.forwarding_cpus),
             plan.queue_mapping_mode,
             plan.xps_mode,
+            plan.rps_mode,
             plan.active_queue_count,
             plan.total_tx_queues,
             plan.irq_actions.len(),
@@ -263,6 +270,20 @@ fn print_network_status(cfg: &ScxConfig) -> Result<()> {
             );
         }
 
+        if !plan.rps_actions.is_empty() {
+            let zeroed = plan
+                .rps_actions
+                .iter()
+                .filter(|action| xps_mask_matches(&action.current_value, &action.indices))
+                .count();
+            println!(
+                "  rps_zeroed={}/{} status={}",
+                zeroed,
+                plan.rps_actions.len(),
+                if zeroed == plan.rps_actions.len() { "ok" } else { "mismatch" }
+            );
+        }
+
         for queue in &plan.status.rx_queues {
             println!("  rx_queue={} rps={}", queue.name, queue.value);
         }
@@ -275,6 +296,10 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     let plans = build_network_locality_plans(cfg)?;
     if plans.is_empty() {
         return Ok(());
+    }
+
+    if irqbalance_conflicts(cfg) {
+        warn!("irqbalance is active while network.apply_irq_affinity=true; it may overwrite manual IRQ affinity");
     }
 
     if dry_run {
@@ -317,6 +342,12 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
                     action.mask
                 );
             }
+            for action in &plan.rps_actions {
+                println!(
+                    "[DRY][NET] iface={} rx_queue={} rps_cpus={} -> {}",
+                    action.interface, action.queue_name, action.current_value, action.mask
+                );
+            }
             for action in &plan.inactive_xps_actions {
                 println!(
                     "[DRY][NET] iface={} inactive_tx_queue={} {}={} -> {}",
@@ -347,6 +378,9 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     let mut xps_ok = 0usize;
     let mut xps_fail = 0usize;
     let mut xps_skip = 0usize;
+    let mut rps_ok = 0usize;
+    let mut rps_fail = 0usize;
+    let mut rps_skip = 0usize;
     let mut inactive_xps_ok = 0usize;
     let mut inactive_xps_fail = 0usize;
     let mut inactive_xps_skip = 0usize;
@@ -434,6 +468,23 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
             }
         }
 
+        for action in plan.rps_actions {
+            if xps_mask_matches(&action.current_value, &action.indices) {
+                rps_skip += 1;
+                continue;
+            }
+
+            if let Err(e) = write_rps_cpus(&action) {
+                rps_fail += 1;
+                warn!(
+                    "rps update failed iface={} rx_queue={} err={}",
+                    action.interface, action.queue_name, e
+                );
+            } else {
+                rps_ok += 1;
+            }
+        }
+
         for action in plan.inactive_xps_actions {
             if xps_mask_matches(&action.current_value, &action.indices) {
                 inactive_xps_skip += 1;
@@ -453,7 +504,7 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
     }
 
     info!(
-        "network locality apply finished: channel_success={} channel_failed={} channel_skipped={} rss_success={} rss_failed={} rss_skipped={} irq_success={} irq_failed={} irq_skipped={} xps_success={} xps_failed={} xps_skipped={} inactive_xps_success={} inactive_xps_failed={} inactive_xps_skipped={}",
+        "network locality apply finished: channel_success={} channel_failed={} channel_skipped={} rss_success={} rss_failed={} rss_skipped={} irq_success={} irq_failed={} irq_skipped={} xps_success={} xps_failed={} xps_skipped={} rps_success={} rps_failed={} rps_skipped={} inactive_xps_success={} inactive_xps_failed={} inactive_xps_skipped={}",
         channel_ok,
         channel_fail,
         channel_skip,
@@ -466,11 +517,20 @@ fn apply_network_locality(cfg: &ScxConfig, dry_run: bool) -> Result<()> {
         xps_ok,
         xps_fail,
         xps_skip,
+        rps_ok,
+        rps_fail,
+        rps_skip,
         inactive_xps_ok,
         inactive_xps_fail,
         inactive_xps_skip
     );
-    if channel_fail > 0 || rss_fail > 0 || irq_fail > 0 || xps_fail > 0 || inactive_xps_fail > 0 {
+    if channel_fail > 0
+        || rss_fail > 0
+        || irq_fail > 0
+        || xps_fail > 0
+        || rps_fail > 0
+        || inactive_xps_fail > 0
+    {
         warn!("some network locality updates failed, verify root permission, ethtool support, and interface state");
     }
 
@@ -1053,6 +1113,7 @@ mod tests {
             forwarding_cpus: vec![2, 3],
             queue_mapping_mode: QueueMappingMode::RoundRobin,
             xps_mode: XpsMode::Cpus,
+            rps_mode: landscape_scx_common::RpsMode::Auto,
             apply_rss_equal: false,
             apply_combined_channels: false,
             clear_inactive_xps: false,
@@ -1072,6 +1133,7 @@ mod tests {
             channel_action: None,
             rss_action: None,
             xps_actions: Vec::new(),
+            rps_actions: Vec::new(),
             inactive_xps_actions: Vec::new(),
             irq_actions: Vec::new(),
         };
@@ -1123,6 +1185,7 @@ mod tests {
                 forwarding_cpus: vec![0, 2],
                 queue_mapping_mode: QueueMappingMode::RoundRobin,
                 xps_mode: XpsMode::Cpus,
+                rps_mode: landscape_scx_common::RpsMode::Auto,
                 apply_rss_equal: false,
                 apply_combined_channels: false,
                 clear_inactive_xps: false,
@@ -1142,6 +1205,7 @@ mod tests {
                 channel_action: None,
                 rss_action: None,
                 xps_actions: Vec::new(),
+                rps_actions: Vec::new(),
                 inactive_xps_actions: Vec::new(),
                 irq_actions: Vec::new(),
             },
@@ -1150,6 +1214,7 @@ mod tests {
                 forwarding_cpus: vec![11, 16],
                 queue_mapping_mode: QueueMappingMode::RoundRobin,
                 xps_mode: XpsMode::Cpus,
+                rps_mode: landscape_scx_common::RpsMode::Auto,
                 apply_rss_equal: false,
                 apply_combined_channels: false,
                 clear_inactive_xps: false,
@@ -1169,6 +1234,7 @@ mod tests {
                 channel_action: None,
                 rss_action: None,
                 xps_actions: Vec::new(),
+                rps_actions: Vec::new(),
                 inactive_xps_actions: Vec::new(),
                 irq_actions: Vec::new(),
             },
@@ -1235,6 +1301,7 @@ mod tests {
             forwarding_cpus: vec![0, 2],
             queue_mapping_mode: QueueMappingMode::RoundRobin,
             xps_mode: XpsMode::Cpus,
+            rps_mode: landscape_scx_common::RpsMode::Auto,
             apply_rss_equal: false,
             apply_combined_channels: false,
             clear_inactive_xps: false,
@@ -1254,6 +1321,7 @@ mod tests {
             channel_action: None,
             rss_action: None,
             xps_actions: Vec::new(),
+            rps_actions: Vec::new(),
             inactive_xps_actions: Vec::new(),
             irq_actions: Vec::new(),
         }];
@@ -1300,6 +1368,7 @@ mod tests {
             forwarding_cpus: vec![11, 16],
             queue_mapping_mode: QueueMappingMode::RoundRobin,
             xps_mode: XpsMode::Cpus,
+            rps_mode: landscape_scx_common::RpsMode::Auto,
             apply_rss_equal: false,
             apply_combined_channels: false,
             clear_inactive_xps: false,
@@ -1319,6 +1388,7 @@ mod tests {
             channel_action: None,
             rss_action: None,
             xps_actions: Vec::new(),
+            rps_actions: Vec::new(),
             inactive_xps_actions: Vec::new(),
             irq_actions: Vec::new(),
         }];

@@ -94,7 +94,8 @@ apply_rss_equal = true
 apply_combined_channels = true
 clear_inactive_xps = true
 queue_mapping_mode = "round_robin"
-xps_mode = "cpus"
+xps_mode = "auto"
+rps_mode = "auto"
 active_queue_count = 16
 ```
 
@@ -108,8 +109,8 @@ apply_rss_equal = true
 apply_combined_channels = true
 clear_inactive_xps = true
 interfaces = [
-  { name = "ens27f0", forwarding_cpus = [2, 3, 4, 5], active_queue_count = 4, xps_mode = "cpus" },
-  { name = "ens16f1np1", forwarding_cpus = [6, 7, 8, 9], active_queue_count = 4, xps_mode = "rxqs" },
+  { name = "ens27f0", forwarding_cpus = [2, 3, 4, 5], active_queue_count = 4, xps_mode = "auto", rps_mode = "auto" },
+  { name = "ens16f1np1", forwarding_cpus = [6, 7, 8, 9], active_queue_count = 4, xps_mode = "rxqs", rps_mode = "preserve" },
 ]
 ```
 
@@ -120,15 +121,31 @@ Supported queue mapping modes:
 
 Supported XPS modes:
 
+- `auto`: prefer `xps_cpus` when forwarding workers are strictly pinned to owner CPUs; otherwise prefer `xps_rxqs` 1:1 when the interface exposes it
 - `cpus`: manage `tx-*/xps_cpus`
 - `rxqs`: manage `tx-*/xps_rxqs` with queue-index bitmasks
 
-`active_queue_count = 0` means "manage all usable queues"; any positive value
-limits management to the first `N` queue IRQs / TX queues for that interface.
+Supported RPS modes:
+
+- `auto`: if RSS is already collapsed to `0..N-1`, zero `rx-*/rps_cpus`
+- `off`: always zero `rx-*/rps_cpus`
+- `preserve`: read `rps_cpus`, but do not modify them
+
+`active_queue_count = 0` means "auto-size". The agent now caps the queue count
+to the smaller of:
+
+- the usable queue/IRQ count for the interface
+- the number of physical dataplane cores represented by `forwarding_cpus`
+
+Any positive value still forces the first `N` queue IRQs / TX queues for that
+interface.
 When enabled, `apply_rss_equal = true` runs `ethtool -X <iface> equal <N>`,
 `apply_combined_channels = true` runs `ethtool -L <iface> combined <N>`, and
 `clear_inactive_xps = true` zeros any `tx-*` XPS files above the active queue
 limit so old full-queue mappings do not leak traffic back into higher queues.
+
+When `network.apply_irq_affinity = true`, `validate`, `status`, and `run` also
+warn if `irqbalance` is active because it may overwrite manual IRQ affinity.
 
 `status` will print current IRQ/XPS values alongside expected values, and `validate`
 will fail if a managed interface or its queue/IRQ files are missing.

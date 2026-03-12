@@ -35,8 +35,8 @@ thread_cpu_classes = [
 # interfaces = ["ens27f0", "ens16f1np1"]
 # Table form allows per-interface CPU islands / queue counts / XPS mode / ethtool policy:
 # interfaces = [
-#   { name = "ens27f0", forwarding_cpus = [0, 1, 2, 3], active_queue_count = 4, apply_rss_equal = true, apply_combined_channels = true, clear_inactive_xps = true, xps_mode = "cpus" },
-#   { name = "ens16f1np1", forwarding_cpus = [4, 5, 6, 7], active_queue_count = 4, xps_mode = "rxqs" },
+#   { name = "ens27f0", forwarding_cpus = [0, 1, 2, 3], active_queue_count = 4, apply_rss_equal = true, apply_combined_channels = true, clear_inactive_xps = true, xps_mode = "auto", rps_mode = "auto" },
+#   { name = "ens16f1np1", forwarding_cpus = [4, 5, 6, 7], active_queue_count = 4, xps_mode = "rxqs", rps_mode = "preserve" },
 # ]
 # Apply IRQ affinity using policy.forwarding_cpus and queue_mapping_mode.
 apply_irq_affinity = false
@@ -51,9 +51,13 @@ clear_inactive_xps = false
 # round_robin => queue N maps to forwarding_cpus[N % len]
 # full_mask   => every queue gets the full forwarding CPU mask
 queue_mapping_mode = "round_robin"
+# auto => prefer xps_cpus when forwarders are strictly pinned, otherwise prefer xps_rxqs when available
 # cpus => manage xps_cpus, rxqs => manage xps_rxqs
-xps_mode = "cpus"
-# 0 means "all usable queues"; otherwise only the first N queue IRQs / TX queues are managed.
+xps_mode = "auto"
+# auto => disable RPS when RSS is already collapsed to 0..N-1, off => always zero rps_cpus, preserve => never touch rps_cpus
+rps_mode = "auto"
+# 0 means "auto-size to the smaller of usable queues and dataplane physical cores";
+# otherwise only the first N queue IRQs / TX queues are managed.
 active_queue_count = 0
 
 [scheduler]
