@@ -261,8 +261,8 @@ pub fn ensure_landscape_scheduler(
 
     register_landscape_scheduler_object(&paths)?;
     pin_landscape_scheduler_maps(&paths)?;
-    wait_for_landscape_scheduler(cfg.ready_timeout_ms)?;
     sync_landscape_scheduler_maps_with_previous(&paths, previous_intent.as_ref(), intent)?;
+    wait_for_landscape_scheduler(cfg.ready_timeout_ms)?;
     write_runtime_state(&paths.runtime_state_path, &runtime_state)?;
     write_intent_state(&paths.intent_state_path, intent)?;
     Ok(())

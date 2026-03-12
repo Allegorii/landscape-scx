@@ -175,7 +175,13 @@ s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
 	if (queue && scx_bpf_dsq_move_to_local(queue->dsq_id))
 		return 0;
 
-	if (is_housekeeping_cpu(owner_cpu) && scx_bpf_dsq_move_to_local(LANDSCAPE_HOUSEKEEPING_DSQ))
+	/*
+	 * During full-switch bootstrap the runtime ownership maps are populated
+	 * by user space immediately after registration. Until then, fall back to
+	 * the housekeeping DSQ so the scheduler can stay alive long enough for the
+	 * first map sync to land.
+	 */
+	if (scx_bpf_dsq_move_to_local(LANDSCAPE_HOUSEKEEPING_DSQ))
 		return 0;
 
 	return 0;
