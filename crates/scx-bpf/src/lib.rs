@@ -19,11 +19,18 @@ const TASK_CTX_MAP_NAME: &str = "task_ctx_map";
 const HOUSEKEEPING_CPU_MAP_NAME: &str = "hk_cpu_map";
 const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "hk_defcpu_map";
 const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 2;
+const ACTIVE_CUSTOM_BPF_STATE_PATH: &str = "/run/landscape-scx/custom-bpf-active.toml";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct LandscapeSchedulerStaticState {
     schema_version: u32,
     switch_mode: ScxSwitchMode,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ActiveCustomBpfState {
+    build_dir: PathBuf,
+    link_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +243,7 @@ pub fn ensure_landscape_scheduler(
     if !needs_reload {
         sync_landscape_scheduler_maps_with_previous(&paths, previous_intent.as_ref(), intent)?;
         write_intent_state(&paths.intent_state_path, intent)?;
+        write_active_custom_bpf_state(&paths)?;
         return Ok(());
     }
 
@@ -247,7 +255,7 @@ pub fn ensure_landscape_scheduler(
     let current_ops = read_sched_ext_ops();
     if current_ops == "landscape_scx" {
         unload_custom_bpf_scheduler_by_name()?;
-        cleanup_custom_bpf_link_dir(&paths.link_dir)?;
+        cleanup_custom_bpf_active_paths(&paths)?;
         wait_for_landscape_scheduler_unloaded(cfg.ready_timeout_ms)?;
     } else if sched_ext_enabled() {
         anyhow::bail!(
@@ -265,6 +273,7 @@ pub fn ensure_landscape_scheduler(
     wait_for_landscape_scheduler(cfg.ready_timeout_ms)?;
     write_runtime_state(&paths.runtime_state_path, &runtime_state)?;
     write_intent_state(&paths.intent_state_path, intent)?;
+    write_active_custom_bpf_state(&paths)?;
     Ok(())
 }
 
@@ -381,9 +390,10 @@ fn unload_custom_bpf_scheduler(cfg: &SchedulerConfig) -> Result<()> {
     let paths = builtin_paths(cfg);
 
     unload_custom_bpf_scheduler_by_name()?;
-    cleanup_custom_bpf_link_dir(&paths.link_dir)?;
+    cleanup_custom_bpf_active_paths(&paths)?;
     let _ = fs::remove_file(&paths.intent_state_path);
     let _ = fs::remove_file(&paths.runtime_state_path);
+    clear_active_custom_bpf_state();
 
     if !sched_ext_enabled() || read_sched_ext_ops() != "landscape_scx" {
         return Ok(());
@@ -433,6 +443,20 @@ fn cleanup_custom_bpf_link_dir(link_dir: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn cleanup_custom_bpf_active_paths(current_paths: &BuiltinSchedulerPaths) -> Result<()> {
+    if let Some(active) = read_active_custom_bpf_state() {
+        cleanup_custom_bpf_link_dir(&active.link_dir)?;
+        let _ = fs::remove_file(active.build_dir.join("intent.toml"));
+        let _ = fs::remove_file(active.build_dir.join("runtime.toml"));
+        if active.link_dir != current_paths.link_dir {
+            cleanup_custom_bpf_link_dir(&current_paths.link_dir)?;
+        }
+    } else {
+        cleanup_custom_bpf_link_dir(&current_paths.link_dir)?;
+    }
     Ok(())
 }
 
@@ -819,6 +843,32 @@ fn write_runtime_state(path: &Path, state: &LandscapeSchedulerStaticState) -> Re
 
 fn read_runtime_state(path: &Path) -> Option<LandscapeSchedulerStaticState> {
     fs::read_to_string(path).ok().and_then(|raw| toml::from_str(&raw).ok())
+}
+
+fn write_active_custom_bpf_state(paths: &BuiltinSchedulerPaths) -> Result<()> {
+    let state = ActiveCustomBpfState {
+        build_dir: paths.build_dir.clone(),
+        link_dir: paths.link_dir.clone(),
+    };
+    let path = Path::new(ACTIVE_CUSTOM_BPF_STATE_PATH);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        path,
+        toml::to_string(&state).context("failed to serialize active custom_bpf state")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn read_active_custom_bpf_state() -> Option<ActiveCustomBpfState> {
+    fs::read_to_string(ACTIVE_CUSTOM_BPF_STATE_PATH).ok().and_then(|raw| toml::from_str(&raw).ok())
+}
+
+fn clear_active_custom_bpf_state() {
+    let _ = fs::remove_file(ACTIVE_CUSTOM_BPF_STATE_PATH);
 }
 
 fn write_intent_state(path: &Path, intent: &LandscapeSchedulerIntent) -> Result<()> {
