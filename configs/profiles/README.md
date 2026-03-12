@@ -46,6 +46,8 @@ These templates are designed for common hardware layouts.
   - built-in `custom_bpf` variant for validating topology-aware `active_queue_count = 0`
   - keeps the same WAN CPU islands, but lets the agent auto-size active queues from usable queues and dataplane physical cores
   - also exercises `xps_mode = "auto"` and `rps_mode = "auto"` on the target NIC
+  - validated on the `archld` target host: both WAN interfaces resolved to `active_queues=8/8`, `xps_mode=Cpus`, and `rps_zeroed=8/8`
+  - on that host this confirms the auto-sizing path ran, but it does not produce a different queue count than the fixed `8q` profile because each WAN already exposes `8` usable queues backed by `8` dataplane physical cores
 
 - `archld-32c-dualwan-8q-custom-bpf-full.toml`
   - full-switch built-in `custom_bpf` variant for dedicated router-host testing
@@ -79,7 +81,10 @@ These templates are designed for common hardware layouts.
 - If your `landscape` instance has extra named threads such as PPPoE or Wi-Fi helpers, treat the Landscape-specific profiles as a starting point, not a final answer
   - refine `thread_include_prefixes`, `thread_exclude_prefixes`, and `thread_cpu_classes` based on the actual thread list from `status` or `ps -eLo pid,tid,comm,cmd`
   - host-tuned profiles like `archld-32c-dualwan.toml` should only be reused after checking WAN IRQ affinity, XPS/RPS masks, and service cgroup layout
-  - queue-capped profiles like `archld-32c-dualwan-8q.toml` can now drive RSS / combined queue count directly, but still need validation on the target NIC before production rollout
+- queue-capped profiles like `archld-32c-dualwan-8q.toml` can now drive RSS / combined queue count directly, but still need validation on the target NIC before production rollout
+- auto-sized profiles like `archld-32c-dualwan-autoq-custom-bpf.toml` are useful for checking topology-aware defaults
+  - on hosts without SMT or without queue/core asymmetry, `active_queue_count = 0` may legitimately resolve to the same queue count as a hand-tuned fixed profile
+  - the real confirmation is that `status` shows resolved `active_queues`, `xps_mode`, and `rps_zeroed` values coming from the agent, not just from static template literals
 
 ## Usage
 
