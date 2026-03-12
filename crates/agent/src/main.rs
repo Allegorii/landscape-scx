@@ -822,19 +822,32 @@ fn matches_forwarding_worker(cfg: &ScxConfig, comm: &str) -> bool {
         .any(|prefix| !prefix.is_empty() && comm.starts_with(prefix))
 }
 
+fn forwarding_worker_requires_interface(comm: &str) -> bool {
+    matches!(comm, "pppd") || comm.starts_with("landscape_pppoe") || comm.starts_with("pppoe-rx-")
+}
+
+fn resolve_forwarding_worker_interface_owner(
+    candidate: &ThreadCandidate,
+    interface_first_qid: &BTreeMap<String, (u32, usize)>,
+) -> Option<(u32, usize)> {
+    interface_first_qid.iter().find_map(|(iface, mapping)| {
+        if candidate.cmdline.contains(iface) || candidate.comm.contains(iface) {
+            Some(*mapping)
+        } else {
+            None
+        }
+    })
+}
+
 fn resolve_forwarding_worker_intent(
     cfg: &ScxConfig,
     candidate: &ThreadCandidate,
     owner_cpu_to_qid: &BTreeMap<usize, u32>,
     interface_first_qid: &BTreeMap<String, (u32, usize)>,
 ) -> Option<LandscapeTaskIntent> {
-    if let Some((qid, owner_cpu)) = interface_first_qid.iter().find_map(|(iface, mapping)| {
-        if candidate.cmdline.contains(iface) || candidate.comm.contains(iface) {
-            Some(*mapping)
-        } else {
-            None
-        }
-    }) {
+    if let Some((qid, owner_cpu)) =
+        resolve_forwarding_worker_interface_owner(candidate, interface_first_qid)
+    {
         return Some(LandscapeTaskIntent {
             pid: candidate.pid,
             tid: candidate.tid,
@@ -844,6 +857,13 @@ fn resolve_forwarding_worker_intent(
             qid,
             owner_cpu,
         });
+    }
+
+    // PPP/PPPoE workers are interface-scoped. If their cmdline/comm no longer
+    // exposes the attach interface, treat them as stale residual processes
+    // instead of falling back to an unrelated owner CPU.
+    if forwarding_worker_requires_interface(&candidate.comm) {
+        return None;
     }
 
     let action = thread_policy_action(cfg, &candidate.comm);
@@ -1195,5 +1215,125 @@ mod tests {
         assert_eq!(action.cpus, vec![11]);
         assert!(action.apply_sched_ext);
         assert!(action.apply_affinity);
+    }
+
+    #[test]
+    fn builtin_intent_filters_stale_pppd_without_interface_binding() {
+        let mut cfg = ScxConfig::default();
+        cfg.scheduler.mode = landscape_scx_common::SchedulerMode::CustomBpf;
+        cfg.scheduler.custom_bpf.forwarding_thread_prefixes = vec!["pppd".into()];
+        cfg.policy.thread_cpu_classes = vec![ThreadCpuClass {
+            thread_name_prefix: "pppd".into(),
+            cpus: vec![20],
+            apply_sched_ext: Some(false),
+            apply_affinity: Some(true),
+        }];
+
+        let plans = vec![InterfaceLocalityPlan {
+            interface: "ens27f0".into(),
+            forwarding_cpus: vec![0, 2],
+            queue_mapping_mode: QueueMappingMode::RoundRobin,
+            xps_mode: XpsMode::Cpus,
+            apply_rss_equal: false,
+            apply_combined_channels: false,
+            clear_inactive_xps: false,
+            active_queue_count: 2,
+            total_tx_queues: 2,
+            total_rx_queues: 2,
+            total_irqs: 2,
+            status: InterfaceLocalityStatus {
+                interface: "ens27f0".into(),
+                tx_xps_cpus: Vec::new(),
+                tx_xps_rxqs: Vec::new(),
+                rx_queues: Vec::new(),
+                irqs: Vec::new(),
+                channel_status: None,
+                rss_status: None,
+            },
+            channel_action: None,
+            rss_action: None,
+            xps_actions: Vec::new(),
+            inactive_xps_actions: Vec::new(),
+            irq_actions: Vec::new(),
+        }];
+        let candidates = vec![
+            ThreadCandidate {
+                pid: 200,
+                tid: 200,
+                start_time_ns: 20_000,
+                comm: "pppd".into(),
+                cmdline: String::new(),
+                cgroup: String::new(),
+            },
+            ThreadCandidate {
+                pid: 201,
+                tid: 201,
+                start_time_ns: 20_100,
+                comm: "pppd".into(),
+                cmdline: "pppd nodetach call ppp-ens27f0-h8a".into(),
+                cgroup: String::new(),
+            },
+        ];
+
+        let intent = build_landscape_scheduler_intent(&cfg, &plans, &candidates);
+        assert_eq!(intent.tasks.len(), 1);
+        assert_eq!(intent.tasks[0].tid, 201);
+        assert_eq!(intent.tasks[0].qid, 0);
+        assert_eq!(intent.tasks[0].owner_cpu, 0);
+    }
+
+    #[test]
+    fn builtin_intent_allows_generic_forwarder_single_cpu_fallback() {
+        let mut cfg = ScxConfig::default();
+        cfg.scheduler.mode = landscape_scx_common::SchedulerMode::CustomBpf;
+        cfg.scheduler.custom_bpf.forwarding_thread_prefixes = vec!["landscape-forwarder".into()];
+        cfg.policy.thread_cpu_classes = vec![ThreadCpuClass {
+            thread_name_prefix: "landscape-forwarder".into(),
+            cpus: vec![11],
+            apply_sched_ext: Some(false),
+            apply_affinity: Some(true),
+        }];
+
+        let plans = vec![InterfaceLocalityPlan {
+            interface: "ens16f1np1".into(),
+            forwarding_cpus: vec![11, 16],
+            queue_mapping_mode: QueueMappingMode::RoundRobin,
+            xps_mode: XpsMode::Cpus,
+            apply_rss_equal: false,
+            apply_combined_channels: false,
+            clear_inactive_xps: false,
+            active_queue_count: 2,
+            total_tx_queues: 2,
+            total_rx_queues: 2,
+            total_irqs: 2,
+            status: InterfaceLocalityStatus {
+                interface: "ens16f1np1".into(),
+                tx_xps_cpus: Vec::new(),
+                tx_xps_rxqs: Vec::new(),
+                rx_queues: Vec::new(),
+                irqs: Vec::new(),
+                channel_status: None,
+                rss_status: None,
+            },
+            channel_action: None,
+            rss_action: None,
+            xps_actions: Vec::new(),
+            inactive_xps_actions: Vec::new(),
+            irq_actions: Vec::new(),
+        }];
+        let candidates = vec![ThreadCandidate {
+            pid: 300,
+            tid: 301,
+            start_time_ns: 42_000,
+            comm: "landscape-forwarder".into(),
+            cmdline: String::new(),
+            cgroup: String::new(),
+        }];
+
+        let intent = build_landscape_scheduler_intent(&cfg, &plans, &candidates);
+        assert_eq!(intent.tasks.len(), 1);
+        assert_eq!(intent.tasks[0].tid, 301);
+        assert_eq!(intent.tasks[0].qid, 0);
+        assert_eq!(intent.tasks[0].owner_cpu, 11);
     }
 }
