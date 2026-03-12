@@ -650,7 +650,7 @@ fn apply_builtin_switch_to_candidates(
     let intent_actions = intent
         .tasks
         .iter()
-        .map(|task| (task.tid, builtin_task_policy_action(task)))
+        .map(|task| (task.key(), builtin_task_policy_action(task)))
         .collect::<BTreeMap<_, _>>();
 
     info!("discovered {} candidate threads", list.len());
@@ -659,7 +659,7 @@ fn apply_builtin_switch_to_candidates(
         info!("dry-run mode, no scheduler syscalls will be issued");
         for c in list {
             let action = intent_actions
-                .get(&c.tid)
+                .get(&c.task_key())
                 .cloned()
                 .unwrap_or_else(|| thread_policy_action(cfg, &c.comm));
             println!(
@@ -683,7 +683,7 @@ fn apply_builtin_switch_to_candidates(
 
     for c in list {
         let action = intent_actions
-            .get(&c.tid)
+            .get(&c.task_key())
             .cloned()
             .unwrap_or_else(|| thread_policy_action(cfg, &c.comm));
 
@@ -769,6 +769,7 @@ fn build_landscape_scheduler_intent(
             owner_cpu_to_qid.get(&cpu).copied().map(|qid| LandscapeTaskIntent {
                 pid: candidate.pid,
                 tid: candidate.tid,
+                start_time_ns: candidate.start_time_ns,
                 comm: candidate.comm.clone(),
                 kind: LandscapeTaskKind::Ksoftirqd,
                 qid,
@@ -788,12 +789,12 @@ fn build_landscape_scheduler_intent(
         let Some(task) = task else {
             continue;
         };
-        if seen.insert(task.tid) {
+        if seen.insert(task.key()) {
             tasks.push(task);
         }
     }
 
-    tasks.sort_by(|a, b| a.qid.cmp(&b.qid).then_with(|| a.tid.cmp(&b.tid)));
+    tasks.sort_by(|a, b| a.qid.cmp(&b.qid).then_with(|| a.key().cmp(&b.key())));
 
     LandscapeSchedulerIntent {
         switch_mode: cfg.scheduler.custom_bpf.switch_mode.clone(),
@@ -837,6 +838,7 @@ fn resolve_forwarding_worker_intent(
         return Some(LandscapeTaskIntent {
             pid: candidate.pid,
             tid: candidate.tid,
+            start_time_ns: candidate.start_time_ns,
             comm: candidate.comm.clone(),
             kind: LandscapeTaskKind::ForwardingWorker,
             qid,
@@ -853,6 +855,7 @@ fn resolve_forwarding_worker_intent(
     owner_cpu_to_qid.get(&owner_cpu).copied().map(|qid| LandscapeTaskIntent {
         pid: candidate.pid,
         tid: candidate.tid,
+        start_time_ns: candidate.start_time_ns,
         comm: candidate.comm.clone(),
         kind: LandscapeTaskKind::ForwardingWorker,
         qid,
@@ -925,8 +928,8 @@ fn select_builtin_scheduler_candidates(
     intent: &LandscapeSchedulerIntent,
     candidates: &[ThreadCandidate],
 ) -> Vec<ThreadCandidate> {
-    let tids = intent.tasks.iter().map(|task| task.tid).collect::<BTreeSet<_>>();
-    candidates.iter().filter(|c| tids.contains(&c.tid)).cloned().collect()
+    let task_keys = intent.tasks.iter().map(|task| task.key()).collect::<BTreeSet<_>>();
+    candidates.iter().filter(|c| task_keys.contains(&c.task_key())).cloned().collect()
 }
 
 fn ensure_scheduler_with_fallback(cfg: &ScxConfig) -> Result<()> {
@@ -1055,6 +1058,7 @@ mod tests {
             ThreadCandidate {
                 pid: 15,
                 tid: 15,
+                start_time_ns: 1_500,
                 comm: "ksoftirqd/2".into(),
                 cmdline: String::new(),
                 cgroup: String::new(),
@@ -1062,6 +1066,7 @@ mod tests {
             ThreadCandidate {
                 pid: 16,
                 tid: 16,
+                start_time_ns: 1_600,
                 comm: "ksoftirqd/3".into(),
                 cmdline: String::new(),
                 cgroup: String::new(),
@@ -1151,6 +1156,7 @@ mod tests {
             ThreadCandidate {
                 pid: 200,
                 tid: 200,
+                start_time_ns: 20_000,
                 comm: "pppd".into(),
                 cmdline: "pppd nodetach call ppp-ens27f0-h8a".into(),
                 cgroup: String::new(),
@@ -1158,6 +1164,7 @@ mod tests {
             ThreadCandidate {
                 pid: 201,
                 tid: 201,
+                start_time_ns: 20_100,
                 comm: "pppd".into(),
                 cmdline: "pppd nodetach call ppp-ens16f1np1-uplink".into(),
                 cgroup: String::new(),
@@ -1178,6 +1185,7 @@ mod tests {
         let action = builtin_task_policy_action(&LandscapeTaskIntent {
             pid: 15630,
             tid: 15630,
+            start_time_ns: 123_456,
             comm: "pppd".into(),
             kind: LandscapeTaskKind::ForwardingWorker,
             qid: 8,

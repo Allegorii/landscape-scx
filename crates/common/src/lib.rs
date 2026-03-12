@@ -190,6 +190,13 @@ pub struct LandscapeSchedulerIntent {
     pub tasks: Vec<LandscapeTaskIntent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LandscapeTaskKey {
+    pub pid: i32,
+    pub tid: i32,
+    pub start_time_ns: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LandscapeQueueIntent {
     pub qid: u32,
@@ -210,10 +217,21 @@ pub enum LandscapeTaskKind {
 pub struct LandscapeTaskIntent {
     pub pid: i32,
     pub tid: i32,
+    pub start_time_ns: u64,
     pub comm: String,
     pub kind: LandscapeTaskKind,
     pub qid: u32,
     pub owner_cpu: usize,
+}
+
+impl LandscapeTaskIntent {
+    pub fn key(&self) -> LandscapeTaskKey {
+        LandscapeTaskKey {
+            pid: self.pid,
+            tid: self.tid,
+            start_time_ns: self.start_time_ns,
+        }
+    }
 }
 
 impl Default for ScxConfig {
@@ -387,9 +405,20 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ScxConfig> {
 pub struct ThreadCandidate {
     pub pid: i32,
     pub tid: i32,
+    pub start_time_ns: u64,
     pub comm: String,
     pub cmdline: String,
     pub cgroup: String,
+}
+
+impl ThreadCandidate {
+    pub fn task_key(&self) -> LandscapeTaskKey {
+        LandscapeTaskKey {
+            pid: self.pid,
+            tid: self.tid,
+            start_time_ns: self.start_time_ns,
+        }
+    }
 }
 
 pub fn discover_candidates(cfg: &ScxConfig) -> Result<Vec<ThreadCandidate>> {
@@ -431,6 +460,10 @@ pub fn discover_candidates(cfg: &ScxConfig) -> Result<Vec<ThreadCandidate>> {
                 Ok(v) => v.trim().to_string(),
                 Err(_) => continue,
             };
+            let start_time_ns = match read_task_start_time_ns(pid, tid) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
             if !matches_target(&comm, &cmdline, &cgroup, cfg) {
                 continue;
@@ -439,6 +472,7 @@ pub fn discover_candidates(cfg: &ScxConfig) -> Result<Vec<ThreadCandidate>> {
             out.push(ThreadCandidate {
                 pid,
                 tid,
+                start_time_ns,
                 comm,
                 cmdline: cmdline.clone(),
                 cgroup: cgroup.clone(),
@@ -518,6 +552,33 @@ fn read_cmdline(pid: i32) -> io::Result<String> {
 
 fn read_cgroup(pid: i32) -> io::Result<String> {
     fs::read_to_string(format!("/proc/{pid}/cgroup"))
+}
+
+fn read_task_start_time_ns(pid: i32, tid: i32) -> io::Result<u64> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"))?;
+    let Some(comm_end) = raw.rfind(") ") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing task stat comm terminator",
+        ));
+    };
+    let fields = raw[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+    let Some(start_ticks_raw) = fields.get(19) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing task stat start time"));
+    };
+    let start_ticks = start_ticks_raw
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let ticks_per_sec = task_clock_ticks_per_sec()?;
+    Ok(start_ticks.saturating_mul(1_000_000_000u64) / ticks_per_sec)
+}
+
+fn task_clock_ticks_per_sec() -> io::Result<u64> {
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if value <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value as u64)
 }
 
 #[repr(C)]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,10 +7,35 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use landscape_scx_common::{
-    LandscapeSchedulerIntent, LandscapeTaskKind, SchedulerConfig, SchedulerMode, ScxSwitchMode,
+    LandscapeSchedulerIntent, LandscapeTaskIntent, LandscapeTaskKey, LandscapeTaskKind,
+    SchedulerConfig, SchedulerMode, ScxSwitchMode,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+
+const LANDSCAPE_TASK_F_DATAPLANE: u32 = 1;
+const QID_OWNER_MAP_NAME: &str = "qid_owner_map";
+const TASK_CTX_MAP_NAME: &str = "task_ctx_map";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct LandscapeSchedulerStaticState {
+    switch_mode: ScxSwitchMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueOwnerMapValue {
+    qid: u32,
+    owner_cpu: u32,
+    dsq_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskCtxMapValue {
+    qid: u32,
+    owner_cpu: u32,
+    flags: u32,
+    reserved: u32,
+}
 
 pub fn read_sched_ext_state() -> String {
     fs::read_to_string("/sys/kernel/sched_ext/state")
@@ -72,10 +98,12 @@ pub fn validate_custom_bpf_runtime(cfg: &SchedulerConfig) -> Result<()> {
         build_dir: temp_root.clone(),
         link_dir: temp_root.join("links"),
         source_file: source_file.clone(),
+        source_copy_path: temp_root.join("landscape_scx.bpf.c"),
         object_file_path: temp_root.join("landscape_scx.bpf.o"),
         vmlinux_header_path: temp_root.join("vmlinux.h"),
         autogen_header_path: temp_root.join("landscape_scx.autogen.h"),
         intent_state_path: temp_root.join("intent.toml"),
+        runtime_state_path: temp_root.join("runtime.toml"),
     };
 
     fs::create_dir_all(&paths.build_dir)
@@ -108,10 +136,24 @@ pub fn load_landscape_scheduler(_intent: &LandscapeSchedulerIntent) -> Result<()
     anyhow::bail!("load_landscape_scheduler now requires SchedulerConfig; call ensure_landscape_scheduler() from the agent path")
 }
 
-pub fn sync_landscape_scheduler_maps(_intent: &LandscapeSchedulerIntent) -> Result<()> {
-    anyhow::bail!(
-        "custom_bpf map syncing is not wired yet; the generated intent is available from the agent for future qid_to_cpu/cpu_to_qid/task_to_qid updates"
+pub fn sync_landscape_scheduler_maps(
+    cfg: &SchedulerConfig,
+    intent: &LandscapeSchedulerIntent,
+) -> Result<()> {
+    if !matches!(cfg.mode, SchedulerMode::CustomBpf) {
+        anyhow::bail!("sync_landscape_scheduler_maps requires scheduler.mode=custom_bpf");
+    }
+
+    let paths = builtin_paths(cfg);
+    let previous_intent =
+        read_intent_state(&paths.intent_state_path).and_then(|raw| toml::from_str(&raw).ok());
+    sync_landscape_scheduler_maps_with_previous(&paths, previous_intent.as_ref(), intent)?;
+    fs::write(
+        &paths.intent_state_path,
+        toml::to_string(intent).context("failed to serialize scheduler intent")?,
     )
+    .with_context(|| format!("failed to write {}", paths.intent_state_path.display()))?;
+    Ok(())
 }
 
 pub fn describe_landscape_scheduler_intent(intent: &LandscapeSchedulerIntent) -> String {
@@ -148,8 +190,8 @@ pub fn describe_landscape_scheduler_intent(intent: &LandscapeSchedulerIntent) ->
     ));
     for task in &intent.tasks {
         out.push_str(&format!(
-            "    tid={} pid={} kind={:?} comm={} qid={} owner_cpu={}\n",
-            task.tid, task.pid, task.kind, task.comm, task.qid, task.owner_cpu
+            "    tid={} pid={} start_time_ns={} kind={:?} comm={} qid={} owner_cpu={}\n",
+            task.tid, task.pid, task.start_time_ns, task.kind, task.comm, task.qid, task.owner_cpu
         ));
     }
 
@@ -170,13 +212,17 @@ pub fn ensure_landscape_scheduler(
     fs::create_dir_all(&paths.link_dir)
         .with_context(|| format!("failed to create {}", paths.link_dir.display()))?;
 
-    let intent_state = toml::to_string(intent).context("failed to serialize scheduler intent")?;
-    let needs_reload = read_intent_state(&paths.intent_state_path).as_deref()
-        != Some(intent_state.as_str())
+    let runtime_state = LandscapeSchedulerStaticState { switch_mode: intent.switch_mode.clone() };
+    let previous_intent =
+        read_intent_state(&paths.intent_state_path).and_then(|raw| toml::from_str(&raw).ok());
+    let needs_reload = read_runtime_state(&paths.runtime_state_path).as_ref()
+        != Some(&runtime_state)
         || read_sched_ext_ops() != "landscape_scx"
         || !sched_ext_enabled();
 
     if !needs_reload {
+        sync_landscape_scheduler_maps_with_previous(&paths, previous_intent.as_ref(), intent)?;
+        write_intent_state(&paths.intent_state_path, intent)?;
         return Ok(());
     }
 
@@ -201,9 +247,11 @@ pub fn ensure_landscape_scheduler(
     }
 
     register_landscape_scheduler_object(&paths)?;
+    pin_landscape_scheduler_maps(&paths)?;
     wait_for_landscape_scheduler(cfg.ready_timeout_ms)?;
-    fs::write(&paths.intent_state_path, intent_state)
-        .with_context(|| format!("failed to write {}", paths.intent_state_path.display()))?;
+    sync_landscape_scheduler_maps_with_previous(&paths, previous_intent.as_ref(), intent)?;
+    write_runtime_state(&paths.runtime_state_path, &runtime_state)?;
+    write_intent_state(&paths.intent_state_path, intent)?;
     Ok(())
 }
 
@@ -322,6 +370,7 @@ fn unload_custom_bpf_scheduler(cfg: &SchedulerConfig) -> Result<()> {
     unload_custom_bpf_scheduler_by_name()?;
     cleanup_custom_bpf_link_dir(&paths.link_dir)?;
     let _ = fs::remove_file(&paths.intent_state_path);
+    let _ = fs::remove_file(&paths.runtime_state_path);
 
     if !sched_ext_enabled() || read_sched_ext_ops() != "landscape_scx" {
         return Ok(());
@@ -356,8 +405,9 @@ fn cleanup_custom_bpf_link_dir(link_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Best effort: if a previous pinned struct_ops link remains after the
-    // scheduler has already exited, bpftool register will fail with EEXIST.
+    // Best effort: if previous pinned struct_ops links or map pins remain after
+    // the scheduler has already exited, bpftool register/pin will fail with
+    // EEXIST.
     for entry in
         fs::read_dir(link_dir).with_context(|| format!("failed to read {}", link_dir.display()))?
     {
@@ -365,6 +415,8 @@ fn cleanup_custom_bpf_link_dir(link_dir: &Path) -> Result<()> {
         let path = entry.path();
         if path.is_file() {
             let _ = fs::remove_file(&path);
+        } else if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
         }
     }
 
@@ -417,6 +469,281 @@ fn wait_for_landscape_scheduler_unloaded(timeout_ms: u64) -> Result<()> {
     )
 }
 
+fn sync_landscape_scheduler_maps_with_previous(
+    paths: &BuiltinSchedulerPaths,
+    previous_intent: Option<&LandscapeSchedulerIntent>,
+    intent: &LandscapeSchedulerIntent,
+) -> Result<()> {
+    let qid_owner_path = builtin_qid_owner_map_path(paths);
+    let task_ctx_path = builtin_task_ctx_map_path(paths);
+    let current_qid_owners = qid_owner_entries_from_intent(intent)?;
+    let previous_qid_owners =
+        previous_intent.map(qid_owner_entries_from_intent).transpose()?.unwrap_or_default();
+    let current_task_ctx = task_ctx_entries_from_intent(intent)?;
+    let previous_task_ctx =
+        previous_intent.map(task_ctx_entries_from_intent).transpose()?.unwrap_or_default();
+
+    for (owner_cpu, value) in &current_qid_owners {
+        bpftool_map_update_pinned(
+            &qid_owner_path,
+            &owner_cpu.to_ne_bytes(),
+            &queue_owner_value_bytes(*value),
+        )?;
+    }
+    for owner_cpu in previous_qid_owners.keys() {
+        if !current_qid_owners.contains_key(owner_cpu) {
+            bpftool_map_delete_pinned(&qid_owner_path, &owner_cpu.to_ne_bytes())?;
+        }
+    }
+
+    for (task_key, value) in &current_task_ctx {
+        bpftool_map_update_pinned(
+            &task_ctx_path,
+            &task_key_bytes(task_key)?,
+            &task_ctx_value_bytes(*value),
+        )?;
+    }
+    for task_key in previous_task_ctx.keys() {
+        if !current_task_ctx.contains_key(task_key) {
+            bpftool_map_delete_pinned(&task_ctx_path, &task_key_bytes(task_key)?)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn qid_owner_entries_from_intent(
+    intent: &LandscapeSchedulerIntent,
+) -> Result<BTreeMap<u32, QueueOwnerMapValue>> {
+    let mut entries = BTreeMap::new();
+    for queue in &intent.queues {
+        let owner_cpu =
+            u32::try_from(queue.owner_cpu).context("queue owner_cpu does not fit into u32")?;
+        entries.insert(
+            owner_cpu,
+            QueueOwnerMapValue { qid: queue.qid, owner_cpu, dsq_id: queue.dsq_id },
+        );
+    }
+    Ok(entries)
+}
+
+fn task_ctx_entries_from_intent(
+    intent: &LandscapeSchedulerIntent,
+) -> Result<BTreeMap<LandscapeTaskKey, TaskCtxMapValue>> {
+    let mut entries = BTreeMap::new();
+    for task in &intent.tasks {
+        let owner_cpu =
+            u32::try_from(task.owner_cpu).context("task owner_cpu does not fit into u32")?;
+        entries.insert(
+            task.key(),
+            TaskCtxMapValue {
+                qid: task.qid,
+                owner_cpu,
+                flags: task_flags(task),
+                reserved: 0,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn task_flags(task: &LandscapeTaskIntent) -> u32 {
+    match task.kind {
+        LandscapeTaskKind::Ksoftirqd | LandscapeTaskKind::ForwardingWorker => {
+            LANDSCAPE_TASK_F_DATAPLANE
+        }
+    }
+}
+
+fn pin_landscape_scheduler_maps(paths: &BuiltinSchedulerPaths) -> Result<()> {
+    let map_dir = builtin_map_dir(paths);
+    fs::create_dir_all(&map_dir)
+        .with_context(|| format!("failed to create {}", map_dir.display()))?;
+
+    pin_landscape_scheduler_map_by_name(QID_OWNER_MAP_NAME, &builtin_qid_owner_map_path(paths))?;
+    pin_landscape_scheduler_map_by_name(TASK_CTX_MAP_NAME, &builtin_task_ctx_map_path(paths))?;
+    Ok(())
+}
+
+fn pin_landscape_scheduler_map_by_name(name: &str, pin_path: &Path) -> Result<()> {
+    if pin_path.exists() {
+        let _ = fs::remove_file(pin_path);
+    }
+
+    let Some(map_id) = find_loaded_map_id_by_name(name)? else {
+        anyhow::bail!("failed to find loaded BPF map named {}", name);
+    };
+
+    let output = Command::new("bpftool")
+        .args(["map", "pin", "id", &map_id.to_string()])
+        .arg(pin_path)
+        .output()
+        .with_context(|| format!("failed to pin BPF map {} to {}", name, pin_path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "bpftool map pin failed for {}: {}",
+            name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+fn find_loaded_map_id_by_name(name: &str) -> Result<Option<u32>> {
+    let output = Command::new("bpftool")
+        .args(["map", "show"])
+        .output()
+        .context("failed to execute bpftool map show")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "bpftool map show failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut match_id = None;
+    for line in stdout.lines() {
+        let Some((id_raw, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(id) = id_raw.trim().parse::<u32>() else {
+            continue;
+        };
+        let fields = rest.split_whitespace().collect::<Vec<_>>();
+        let Some(name_index) = fields.iter().position(|field| *field == "name") else {
+            continue;
+        };
+        if fields.get(name_index + 1) == Some(&name) {
+            match_id = Some(id);
+        }
+    }
+
+    Ok(match_id)
+}
+
+fn bpftool_map_update_pinned(pin_path: &Path, key_bytes: &[u8], value_bytes: &[u8]) -> Result<()> {
+    let mut args = vec![
+        "map".to_string(),
+        "update".to_string(),
+        "pinned".to_string(),
+        pin_path.display().to_string(),
+        "key".to_string(),
+        "hex".to_string(),
+    ];
+    args.extend(hex_byte_args(key_bytes));
+    args.push("value".to_string());
+    args.push("hex".to_string());
+    args.extend(hex_byte_args(value_bytes));
+    args.push("any".to_string());
+
+    let output = Command::new("bpftool")
+        .args(&args)
+        .output()
+        .with_context(|| format!("failed to update pinned BPF map {}", pin_path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "bpftool map update failed for {}: {}",
+            pin_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+fn bpftool_map_delete_pinned(pin_path: &Path, key_bytes: &[u8]) -> Result<()> {
+    let mut args = vec![
+        "map".to_string(),
+        "delete".to_string(),
+        "pinned".to_string(),
+        pin_path.display().to_string(),
+        "key".to_string(),
+        "hex".to_string(),
+    ];
+    args.extend(hex_byte_args(key_bytes));
+
+    let output = Command::new("bpftool")
+        .args(&args)
+        .output()
+        .with_context(|| format!("failed to delete from pinned BPF map {}", pin_path.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No such file or directory")
+        || stderr.contains("not found")
+        || stderr.contains("element not found")
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!("bpftool map delete failed for {}: {}", pin_path.display(), stderr.trim())
+}
+
+fn queue_owner_value_bytes(value: QueueOwnerMapValue) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&value.qid.to_ne_bytes());
+    bytes.extend_from_slice(&value.owner_cpu.to_ne_bytes());
+    bytes.extend_from_slice(&value.dsq_id.to_ne_bytes());
+    bytes
+}
+
+fn task_ctx_value_bytes(value: TaskCtxMapValue) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&value.qid.to_ne_bytes());
+    bytes.extend_from_slice(&value.owner_cpu.to_ne_bytes());
+    bytes.extend_from_slice(&value.flags.to_ne_bytes());
+    bytes.extend_from_slice(&value.reserved.to_ne_bytes());
+    bytes
+}
+
+fn task_key_bytes(task_key: &LandscapeTaskKey) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(
+        &u32::try_from(task_key.pid).context("task key pid does not fit into u32")?.to_ne_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(task_key.tid).context("task key tid does not fit into u32")?.to_ne_bytes(),
+    );
+    bytes.extend_from_slice(&task_key.start_time_ns.to_ne_bytes());
+    Ok(bytes)
+}
+
+fn hex_byte_args(bytes: &[u8]) -> Vec<String> {
+    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+fn builtin_map_dir(paths: &BuiltinSchedulerPaths) -> PathBuf {
+    paths.link_dir.join("maps")
+}
+
+fn builtin_qid_owner_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
+    builtin_map_dir(paths).join(QID_OWNER_MAP_NAME)
+}
+
+fn builtin_task_ctx_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
+    builtin_map_dir(paths).join(TASK_CTX_MAP_NAME)
+}
+
+fn write_runtime_state(path: &Path, state: &LandscapeSchedulerStaticState) -> Result<()> {
+    fs::write(path, toml::to_string(state).context("failed to serialize runtime state")?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn read_runtime_state(path: &Path) -> Option<LandscapeSchedulerStaticState> {
+    fs::read_to_string(path).ok().and_then(|raw| toml::from_str(&raw).ok())
+}
+
+fn write_intent_state(path: &Path, intent: &LandscapeSchedulerIntent) -> Result<()> {
+    fs::write(path, toml::to_string(intent).context("failed to serialize scheduler intent")?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 fn read_pid_file(path: &Path) -> Result<Option<i32>> {
     if !path.exists() {
         return Ok(None);
@@ -435,10 +762,12 @@ struct BuiltinSchedulerPaths {
     build_dir: PathBuf,
     link_dir: PathBuf,
     source_file: PathBuf,
+    source_copy_path: PathBuf,
     object_file_path: PathBuf,
     vmlinux_header_path: PathBuf,
     autogen_header_path: PathBuf,
     intent_state_path: PathBuf,
+    runtime_state_path: PathBuf,
 }
 
 fn builtin_paths(cfg: &SchedulerConfig) -> BuiltinSchedulerPaths {
@@ -446,10 +775,12 @@ fn builtin_paths(cfg: &SchedulerConfig) -> BuiltinSchedulerPaths {
     BuiltinSchedulerPaths {
         link_dir: cfg.custom_bpf.link_dir.clone(),
         source_file: cfg.custom_bpf.source_file.clone(),
+        source_copy_path: build_dir.join("landscape_scx.bpf.c"),
         object_file_path: build_dir.join("landscape_scx.bpf.o"),
         vmlinux_header_path: build_dir.join("vmlinux.h"),
         autogen_header_path: build_dir.join("landscape_scx.autogen.h"),
         intent_state_path: build_dir.join("intent.toml"),
+        runtime_state_path: build_dir.join("runtime.toml"),
         build_dir,
     }
 }
@@ -480,7 +811,13 @@ fn compile_landscape_scheduler_object(paths: &BuiltinSchedulerPaths) -> Result<(
     } else {
         anyhow::bail!("missing /usr/include/bpf; install libbpf headers");
     };
-    let source_dir = paths.source_file.parent().unwrap_or_else(|| Path::new("."));
+    fs::copy(&paths.source_file, &paths.source_copy_path).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            paths.source_file.display(),
+            paths.source_copy_path.display()
+        )
+    })?;
 
     let output = Command::new("clang")
         .arg("-target")
@@ -491,20 +828,20 @@ fn compile_landscape_scheduler_object(paths: &BuiltinSchedulerPaths) -> Result<(
         .arg("-I")
         .arg(&paths.build_dir)
         .arg("-I")
-        .arg(source_dir)
-        .arg("-I")
         .arg(include_bpf)
         .arg("-c")
-        .arg(&paths.source_file)
+        .arg(&paths.source_copy_path)
         .arg("-o")
         .arg(&paths.object_file_path)
         .output()
-        .with_context(|| format!("failed to execute clang for {}", paths.source_file.display()))?;
+        .with_context(|| {
+            format!("failed to execute clang for {}", paths.source_copy_path.display())
+        })?;
 
     if !output.status.success() {
         anyhow::bail!(
             "clang failed to compile {}: {}",
-            paths.source_file.display(),
+            paths.source_copy_path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -533,52 +870,13 @@ fn register_landscape_scheduler_object(paths: &BuiltinSchedulerPaths) -> Result<
 fn render_autogen_header(intent: &LandscapeSchedulerIntent) -> String {
     let mut out = String::new();
     out.push_str("/* Auto-generated by landscape-scx-agent. */\n");
-    out.push_str(&format!("#define LANDSCAPE_GEN_TASK_COUNT {}\n", intent.tasks.len()));
-    out.push_str(&format!("#define LANDSCAPE_GEN_QUEUE_COUNT {}\n", intent.queues.len()));
     out.push_str(&format!(
-        "#define LANDSCAPE_GEN_SCX_FLAGS {}\n\n",
+        "#define LANDSCAPE_GEN_SCX_FLAGS {}\n",
         match intent.switch_mode {
             ScxSwitchMode::Partial => "SCX_OPS_SWITCH_PARTIAL",
             ScxSwitchMode::Full => "0",
         }
     ));
-
-    if intent.queues.is_empty() {
-        out.push_str("static const volatile __u32 landscape_gen_queue_owner_cpus[1] = { 0 };\n\n");
-    } else {
-        out.push_str("static const volatile __u32 landscape_gen_queue_owner_cpus[LANDSCAPE_GEN_QUEUE_COUNT] = {\n");
-        for queue in &intent.queues {
-            out.push_str(&format!("    {},\n", queue.owner_cpu));
-        }
-        out.push_str("};\n\n");
-    }
-
-    if intent.tasks.is_empty() {
-        out.push_str(
-            "static const volatile struct landscape_boot_task_ctx landscape_gen_tasks[1] = {\n",
-        );
-        out.push_str("    { .tid = 0, .qid = 0, .owner_cpu = 0, .flags = 0 },\n");
-        out.push_str("};\n");
-        return out;
-    }
-
-    out.push_str(
-        "static const volatile struct landscape_boot_task_ctx landscape_gen_tasks[LANDSCAPE_GEN_TASK_COUNT] = {\n",
-    );
-    for task in &intent.tasks {
-        out.push_str(&format!(
-            "    {{ .tid = {}, .qid = {}, .owner_cpu = {}, .flags = {} }},\n",
-            task.tid,
-            task.qid,
-            task.owner_cpu,
-            match task.kind {
-                LandscapeTaskKind::Ksoftirqd | LandscapeTaskKind::ForwardingWorker => {
-                    "LANDSCAPE_TASK_F_DATAPLANE"
-                }
-            }
-        ));
-    }
-    out.push_str("};\n");
     out
 }
 
@@ -602,7 +900,7 @@ mod tests {
     };
 
     #[test]
-    fn autogen_header_renders_queue_and_task_tables() {
+    fn autogen_header_renders_scheduler_flags_only() {
         let intent = LandscapeSchedulerIntent {
             switch_mode: ScxSwitchMode::Partial,
             housekeeping_cpus: vec![0, 1],
@@ -616,6 +914,7 @@ mod tests {
             tasks: vec![LandscapeTaskIntent {
                 pid: 1,
                 tid: 42,
+                start_time_ns: 123,
                 comm: "ksoftirqd/2".into(),
                 kind: LandscapeTaskKind::Ksoftirqd,
                 qid: 0,
@@ -624,9 +923,9 @@ mod tests {
         };
 
         let header = render_autogen_header(&intent);
-        assert!(header.contains("#define LANDSCAPE_GEN_QUEUE_COUNT 1"));
-        assert!(header.contains("#define LANDSCAPE_GEN_TASK_COUNT 1"));
-        assert!(header.contains("LANDSCAPE_TASK_F_DATAPLANE"));
-        assert!(header.contains("{ .tid = 42, .qid = 0, .owner_cpu = 2"));
+        assert!(header.contains("#define LANDSCAPE_GEN_SCX_FLAGS SCX_OPS_SWITCH_PARTIAL"));
+        assert!(!header.contains("LANDSCAPE_GEN_QUEUE_COUNT"));
+        assert!(!header.contains("LANDSCAPE_GEN_TASK_COUNT"));
+        assert!(!header.contains("LANDSCAPE_TASK_F_DATAPLANE"));
     }
 }
