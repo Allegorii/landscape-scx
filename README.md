@@ -50,9 +50,9 @@ cargo check
 
 The agent now reconciles in two ways:
 
-- event-driven fast path: watches configured `cgroup.procs` files and current
-  `/proc/<pid>/task` directories so service restarts, PPPoE re-dial, and thread
-  churn are picked up quickly
+- event-driven fast path: watches configured `cgroup.procs` /
+  `cgroup.threads` files and current `/proc/<pid>/task` directories so service
+  restarts, PPPoE re-dial, and thread churn are picked up quickly
 - timed fallback: keeps `agent.apply_interval_secs` as a safety reconcile in
   case events are missed
 
@@ -232,8 +232,8 @@ event_debounce_ms = 250
 
 - `apply_interval_secs`: periodic fallback reconcile cadence
 - `event_driven`: enable the inotify-based fast path
-- `event_debounce_ms`: coalesce bursts of `cgroup.procs` / `/proc/<pid>/task`
-  events before one reconcile pass
+- `event_debounce_ms`: coalesce bursts of `cgroup.procs`, `cgroup.threads`,
+  and `/proc/<pid>/task` events before one reconcile pass
 
 When `discovery.cgroup_prefixes` is set, the agent also watches those cgroup
 directories directly. That makes it a good fit for layouts such as

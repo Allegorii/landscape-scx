@@ -466,6 +466,15 @@ fn insert_cgroup_watch_targets(targets: &mut BTreeMap<PathBuf, u32>, cgroup_path
             | libc::IN_DELETE_SELF
             | libc::IN_MOVE_SELF,
     );
+    insert_watch_target(
+        targets,
+        dir_path.join("cgroup.threads"),
+        libc::IN_MODIFY
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_ATTRIB
+            | libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF,
+    );
 }
 
 fn insert_watch_target(targets: &mut BTreeMap<PathBuf, u32>, path: PathBuf, mask: u32) {
@@ -1608,10 +1617,16 @@ mod tests {
             "/sys/fs/cgroup/system.slice/landscape-router.service/cgroup.procs"
         )));
         assert!(target_paths.contains(&std::path::PathBuf::from(
+            "/sys/fs/cgroup/system.slice/landscape-router.service/cgroup.threads"
+        )));
+        assert!(target_paths.contains(&std::path::PathBuf::from(
             "/sys/fs/cgroup/system.slice/landscape-router.service/dataplane"
         )));
         assert!(target_paths.contains(&std::path::PathBuf::from(
             "/sys/fs/cgroup/system.slice/landscape-router.service/dataplane/cgroup.procs"
+        )));
+        assert!(target_paths.contains(&std::path::PathBuf::from(
+            "/sys/fs/cgroup/system.slice/landscape-router.service/dataplane/cgroup.threads"
         )));
     }
 
