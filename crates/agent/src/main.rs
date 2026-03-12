@@ -123,7 +123,8 @@ fn load_scheduler(config: PathBuf) -> Result<()> {
             prepared.intent.queues.len(),
             prepared.intent.tasks.len()
         );
-        ensure_landscape_scheduler_with_fallback(&cfg, &prepared.intent)
+        ensure_landscape_scheduler_with_fallback(&cfg, &prepared.intent)?;
+        apply_builtin_switch_to_candidates(&cfg, &prepared.intent, &prepared.selected, false)
     } else {
         ensure_scheduler_with_fallback(&cfg)
     }

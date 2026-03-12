@@ -179,12 +179,16 @@ link_dir = "/run/landscape-scx/custom-bpf/links"
 Current limitations:
 
 - the built-in scheduler is still an MVP and defaults to `switch_mode = "partial"`
+- `switch_mode = "full"` is now available for dedicated router hosts; non-dataplane
+  tasks are steered into a shared housekeeping DSQ keyed by
+  `scheduler.custom_bpf.housekeeping_cpus`
 - only dataplane tasks present in the generated intent are switched into `SCHED_EXT`
 - forwarding workers first try to infer their target interface from `cmdline`
   and map to that interface's queue-0 owner CPU; if no interface name is
   present, the agent falls back to single-CPU thread class affinity
 - `load-scheduler` now preloads the built-in scheduler with the current
-  generated intent, but it does not switch any tasks into `SCHED_EXT`
+  generated intent and immediately attaches the currently discovered dataplane
+  tasks into `SCHED_EXT`
 - the runtime loader requires local `clang`, `bpftool`, kernel BTF, and root privileges
 - `validate` checks compile-time prerequisites, but the actual `run` path still
   needs root and `bpftool struct_ops` support from the running kernel

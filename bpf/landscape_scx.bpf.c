@@ -16,6 +16,7 @@
 #define LANDSCAPE_MAX_QIDS 128
 #define LANDSCAPE_MAX_TASKS 4096
 #define LANDSCAPE_DSQ_BASE 0x1000ULL
+#define LANDSCAPE_HOUSEKEEPING_DSQ 0x2000ULL
 #define LANDSCAPE_TASK_F_DATAPLANE (1U << 0)
 
 #define BPF_STRUCT_OPS(name, args...) SEC("struct_ops/" #name) BPF_PROG(name, ##args)
@@ -54,6 +55,20 @@ struct {
 	__type(value, struct landscape_task_ctx);
 } task_ctx_map SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, __u32);
+	__type(value, __u8);
+} housekeeping_cpu_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} housekeeping_default_cpu_map SEC(".maps");
+
 #include "landscape_scx.autogen.h"
 
 static __always_inline __u32 task_pid(struct task_struct *p)
@@ -74,6 +89,30 @@ static __always_inline __u64 task_start_time_ns(struct task_struct *p)
 static __always_inline __u64 dsq_for_qid(__u32 qid)
 {
 	return LANDSCAPE_DSQ_BASE + qid;
+}
+
+static __always_inline bool is_housekeeping_cpu(__u32 cpu)
+{
+	__u8 *value;
+
+	value = bpf_map_lookup_elem(&housekeeping_cpu_map, &cpu);
+	return value && *value;
+}
+
+static __always_inline bool default_housekeeping_cpu(__u32 *cpu)
+{
+	__u32 key = 0;
+	__u32 *value;
+
+	if (!cpu)
+		return false;
+
+	value = bpf_map_lookup_elem(&housekeeping_default_cpu_map, &key);
+	if (!value)
+		return false;
+
+	*cpu = *value;
+	return true;
 }
 
 static __always_inline bool lookup_task_ctx(struct task_struct *p, struct landscape_task_ctx *out)
@@ -99,10 +138,17 @@ static __always_inline bool lookup_task_ctx(struct task_struct *p, struct landsc
 s32 BPF_STRUCT_OPS(landscape_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct landscape_task_ctx task = {};
+	__u32 housekeeping_cpu = 0;
 	bool is_idle = false;
 
 	if (lookup_task_ctx(p, &task) && (task.flags & LANDSCAPE_TASK_F_DATAPLANE))
 		return task.owner_cpu;
+
+	if (prev_cpu >= 0 && is_housekeeping_cpu((__u32)prev_cpu))
+		return prev_cpu;
+
+	if (default_housekeeping_cpu(&housekeeping_cpu))
+		return housekeeping_cpu;
 
 	return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 }
@@ -116,7 +162,7 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 		return 0;
 	}
 
-	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+	scx_bpf_dsq_insert(p, LANDSCAPE_HOUSEKEEPING_DSQ, SCX_SLICE_DFL, enq_flags);
 	return 0;
 }
 
@@ -129,6 +175,9 @@ s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
 	if (queue && scx_bpf_dsq_move_to_local(queue->dsq_id))
 		return 0;
 
+	if (is_housekeeping_cpu(owner_cpu) && scx_bpf_dsq_move_to_local(LANDSCAPE_HOUSEKEEPING_DSQ))
+		return 0;
+
 	return 0;
 }
 
@@ -139,6 +188,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(landscape_init)
 #pragma clang loop unroll(disable)
 	for (qid = 0; qid < LANDSCAPE_MAX_QIDS; qid++)
 		scx_bpf_create_dsq(dsq_for_qid(qid), -1);
+	scx_bpf_create_dsq(LANDSCAPE_HOUSEKEEPING_DSQ, -1);
 
 	return 0;
 }

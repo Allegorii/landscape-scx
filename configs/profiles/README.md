@@ -42,6 +42,10 @@ These templates are designed for common hardware layouts.
   - intended for validating queue/task intent with real qids instead of the minimal local loader-only profile
   - includes PPPoE / forwarding-worker prefixes so interface-local WAN workers can join the generated dataplane intent
 
+- `archld-32c-dualwan-8q-custom-bpf-full.toml`
+  - full-switch built-in `custom_bpf` variant for dedicated router-host testing
+  - keeps the same 8-queue WAN locality but routes non-dataplane tasks through housekeeping CPUs/DSQ instead of leaving the machine in partial mode
+
 - `custom-bpf-local-test.toml`
   - minimal local validation profile for the built-in `custom_bpf` loader
   - does not manage NIC locality or switch any workload threads; it is only for verifying compile/register flow
@@ -58,6 +62,10 @@ These templates are designed for common hardware layouts.
 
 - For first bootstrapping on an unknown machine, start with `conservative-any.toml`
   - use this when you want to verify `sched_ext`, permissions, and basic matching before tuning harder
+
+- For dedicated router hosts that should move beyond partial mode, start from `archld-32c-dualwan-8q-custom-bpf-full.toml`
+  - this is the aggressive path for evaluating a full `sched_ext` takeover with explicit housekeeping CPUs
+  - validate it only after the partial `archld-32c-dualwan-8q-custom-bpf.toml` path is already stable on the target host
 
 - Use `balanced-4c.toml`, `balanced-8c.toml`, `low-latency-8c.toml`, and `throughput-16c.toml` as generic baselines or benchmark comparisons
   - these are still useful, but they are broader scheduling templates rather than Landscape-specific defaults
