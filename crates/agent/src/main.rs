@@ -479,8 +479,9 @@ impl ProcConnectorWatcher {
             let mut offset = 0usize;
             let total = rc as usize;
             while offset + std::mem::size_of::<NetlinkMessageHeader>() <= total {
-                let header = unsafe {
-                    &*(buf[offset..].as_ptr().cast::<NetlinkMessageHeader>())
+                let Some(header) = read_unaligned_copy::<NetlinkMessageHeader>(&buf[offset..])
+                else {
+                    break;
                 };
                 let message_len = (header.nlmsg_len as usize).min(total.saturating_sub(offset));
                 if message_len < std::mem::size_of::<NetlinkMessageHeader>() {
@@ -504,10 +505,9 @@ impl ProcConnectorWatcher {
     }
 
     fn message_matches_scope(&self, payload: &[u8]) -> bool {
-        if payload.len() < std::mem::size_of::<ConnectorMessageHeader>() {
+        let Some(cn) = read_unaligned_copy::<ConnectorMessageHeader>(payload) else {
             return false;
-        }
-        let cn = unsafe { &*(payload.as_ptr().cast::<ConnectorMessageHeader>()) };
+        };
         if cn.id.idx != CN_IDX_PROC || cn.id.val != CN_VAL_PROC {
             return false;
         }
@@ -590,41 +590,33 @@ fn nlmsg_align(len: usize) -> usize {
     (len + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1)
 }
 
-fn parse_proc_connector_event_scope(event_bytes: &[u8]) -> Option<(i32, i32)> {
-    if event_bytes.len() < std::mem::size_of::<ProcEventHeader>() {
+fn read_unaligned_copy<T: Copy>(bytes: &[u8]) -> Option<T> {
+    if bytes.len() < std::mem::size_of::<T>() {
         return None;
     }
 
-    let header = unsafe { &*(event_bytes.as_ptr().cast::<ProcEventHeader>()) };
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+}
+
+fn parse_proc_connector_event_scope(event_bytes: &[u8]) -> Option<(i32, i32)> {
+    let header = read_unaligned_copy::<ProcEventHeader>(event_bytes)?;
     let payload = &event_bytes[std::mem::size_of::<ProcEventHeader>()..];
 
     match header.what {
         PROC_EVENT_FORK => {
-            if payload.len() < std::mem::size_of::<ForkProcEvent>() {
-                return None;
-            }
-            let event = unsafe { &*(payload.as_ptr().cast::<ForkProcEvent>()) };
+            let event = read_unaligned_copy::<ForkProcEvent>(payload)?;
             Some((event.child_pid, event.child_tgid))
         }
         PROC_EVENT_EXEC => {
-            if payload.len() < std::mem::size_of::<ExecProcEvent>() {
-                return None;
-            }
-            let event = unsafe { &*(payload.as_ptr().cast::<ExecProcEvent>()) };
+            let event = read_unaligned_copy::<ExecProcEvent>(payload)?;
             Some((event.process_pid, event.process_tgid))
         }
         PROC_EVENT_COMM => {
-            if payload.len() < std::mem::size_of::<CommProcEvent>() {
-                return None;
-            }
-            let event = unsafe { &*(payload.as_ptr().cast::<CommProcEvent>()) };
+            let event = read_unaligned_copy::<CommProcEvent>(payload)?;
             Some((event.process_pid, event.process_tgid))
         }
         PROC_EVENT_EXIT => {
-            if payload.len() < std::mem::size_of::<ExitProcEvent>() {
-                return None;
-            }
-            let event = unsafe { &*(payload.as_ptr().cast::<ExitProcEvent>()) };
+            let event = read_unaligned_copy::<ExitProcEvent>(payload)?;
             Some((event.process_pid, event.process_tgid))
         }
         _ => None,
