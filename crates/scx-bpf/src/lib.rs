@@ -20,6 +20,7 @@ const HOUSEKEEPING_CPU_MAP_NAME: &str = "hk_cpu_map";
 const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "hk_defcpu_map";
 const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 2;
 const ACTIVE_CUSTOM_BPF_STATE_PATH: &str = "/run/landscape-scx/custom-bpf-active.toml";
+const CUSTOM_BPF_BPFFS_PREFIX: &str = "landscape-scx-";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct LandscapeSchedulerStaticState {
@@ -455,8 +456,32 @@ fn cleanup_custom_bpf_active_paths(current_paths: &BuiltinSchedulerPaths) -> Res
             cleanup_custom_bpf_link_dir(&current_paths.link_dir)?;
         }
     } else {
+        cleanup_known_custom_bpf_link_dirs()?;
         cleanup_custom_bpf_link_dir(&current_paths.link_dir)?;
     }
+    Ok(())
+}
+
+fn cleanup_known_custom_bpf_link_dirs() -> Result<()> {
+    let bpffs_root = Path::new("/sys/fs/bpf");
+    if !bpffs_root.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(bpffs_root)
+        .with_context(|| format!("failed to read {}", bpffs_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(CUSTOM_BPF_BPFFS_PREFIX) || !path.is_dir() {
+            continue;
+        }
+        cleanup_custom_bpf_link_dir(&path)?;
+    }
+
     Ok(())
 }
 
