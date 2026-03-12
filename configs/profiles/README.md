@@ -42,6 +42,11 @@ These templates are designed for common hardware layouts.
   - intended for validating queue/task intent with real qids instead of the minimal local loader-only profile
   - includes PPPoE / forwarding-worker prefixes so interface-local WAN workers can join the generated dataplane intent
 
+- `archld-32c-dualwan-autoq-custom-bpf.toml`
+  - built-in `custom_bpf` variant for validating topology-aware `active_queue_count = 0`
+  - keeps the same WAN CPU islands, but lets the agent auto-size active queues from usable queues and dataplane physical cores
+  - also exercises `xps_mode = "auto"` and `rps_mode = "auto"` on the target NIC
+
 - `archld-32c-dualwan-8q-custom-bpf-full.toml`
   - full-switch built-in `custom_bpf` variant for dedicated router-host testing
   - keeps the same 8-queue WAN locality but routes non-dataplane tasks through housekeeping CPUs/DSQ instead of leaving the machine in partial mode
