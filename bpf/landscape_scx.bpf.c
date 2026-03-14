@@ -27,6 +27,7 @@
 #define LANDSCAPE_PRESSURE_LEVEL_HIGH 2U
 #define LANDSCAPE_HOUSEKEEPING_SLICE (SCX_SLICE_DFL / 4)
 #define LANDSCAPE_BACKGROUND_SLICE (SCX_SLICE_DFL / 8)
+#define PF_KTHREAD 0x00200000
 
 #define BPF_STRUCT_OPS(name, args...) SEC("struct_ops/" #name) BPF_PROG(name, ##args)
 #define BPF_STRUCT_OPS_SLEEPABLE(name, args...) SEC("struct_ops.s/" #name) BPF_PROG(name, ##args)
@@ -126,6 +127,12 @@ static __always_inline bool task_is_dataplane(const struct landscape_task_ctx *t
 
 	return task_class_is_dataplane(task->class) ||
 	       (task->flags & LANDSCAPE_TASK_F_DATAPLANE);
+}
+
+static __always_inline bool task_is_percpu_kthread(struct task_struct *p)
+{
+	return (BPF_CORE_READ(p, flags) & PF_KTHREAD) &&
+	       BPF_CORE_READ(p, nr_cpus_allowed) == 1;
 }
 
 static __always_inline bool is_housekeeping_cpu(__u32 cpu)
@@ -240,6 +247,17 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (lookup_task_ctx(p, &task)) {
 		if (task_is_dataplane(&task)) {
+			/*
+			 * Per-CPU kthreads such as ksoftirqd must be able to
+			 * preempt queue-bound workers on their owner CPU, or
+			 * sched_ext's watchdog will trip on runnable-task stall.
+			 */
+			if (task_is_percpu_kthread(p)) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
+						 enq_flags | SCX_ENQ_PREEMPT);
+				return 0;
+			}
+
 			scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), dataplane_slice(task.qid),
 					 enq_flags);
 			return 0;
