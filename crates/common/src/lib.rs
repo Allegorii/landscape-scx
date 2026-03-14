@@ -1105,9 +1105,16 @@ fn auto_discovered_network_interfaces(
     let mut out = Vec::new();
 
     for (group, group_forwarding_cpus) in groups.into_iter().zip(forwarding_cpu_sets.into_iter()) {
+        let compatible_members = auto_discovered_compatible_group_members(
+            cfg,
+            &group.members,
+            network,
+            &group_forwarding_cpus,
+            sys_class_net,
+        );
         let member_cpu_sets =
-            split_group_forwarding_cpus_across_members(&group_forwarding_cpus, group.members.len());
-        for (name, forwarding_cpus) in group.members.into_iter().zip(member_cpu_sets.into_iter()) {
+            split_group_forwarding_cpus_across_members(&group_forwarding_cpus, compatible_members.len());
+        for (name, forwarding_cpus) in compatible_members.into_iter().zip(member_cpu_sets.into_iter()) {
             let mut resolved = ResolvedNetworkInterface {
                 name,
                 auto_discovered: true,
@@ -1127,6 +1134,64 @@ fn auto_discovered_network_interfaces(
     }
 
     Ok(out)
+}
+
+fn auto_discovered_compatible_group_members(
+    cfg: &ScxConfig,
+    members: &[String],
+    network: &NetworkConfig,
+    group_forwarding_cpus: &[usize],
+    sys_class_net: &Path,
+) -> Vec<String> {
+    members
+        .iter()
+        .filter_map(|name| {
+            let mut resolved = ResolvedNetworkInterface {
+                name: name.clone(),
+                auto_discovered: true,
+                forwarding_cpus: group_forwarding_cpus.to_vec(),
+                active_queue_count: network.active_queue_count,
+                apply_rss_equal: network.apply_rss_equal,
+                apply_combined_channels: network.apply_combined_channels,
+                clear_inactive_xps: network.clear_inactive_xps,
+                queue_mapping_mode: network.queue_mapping_mode.clone(),
+                requested_xps_mode: network.xps_mode.clone(),
+                xps_mode: network.xps_mode.clone(),
+                rps_mode: network.rps_mode.clone(),
+            };
+            resolved.xps_mode = effective_xps_mode(cfg, &resolved);
+
+            if auto_discovered_interface_supports_queue_mode(sys_class_net, &resolved) {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn auto_discovered_interface_supports_queue_mode(
+    sys_class_net: &Path,
+    iface: &ResolvedNetworkInterface,
+) -> bool {
+    let iface_root = sys_class_net.join(&iface.name);
+    let tx_count = queue_value_file_count_at(&iface_root, "tx-", "xps_cpus");
+    let tx_rxqs_count = queue_value_file_count_at(&iface_root, "tx-", "xps_rxqs");
+    let any_tx_count = queue_entry_count_at(&iface_root, "tx-");
+
+    if any_tx_count == 0 {
+        return false;
+    }
+
+    if !matches!(iface.rps_mode, RpsMode::Preserve) && queue_entry_count_at(&iface_root, "rx-") == 0 {
+        return false;
+    }
+
+    match iface.xps_mode {
+        XpsMode::Auto => tx_count > 0 || tx_rxqs_count > 0,
+        XpsMode::Cpus => tx_count > 0,
+        XpsMode::Rxqs => tx_rxqs_count > 0,
+    }
 }
 
 fn discover_auto_network_interface_groups(sys_class_net: &Path) -> Result<Vec<AutoDiscoveredInterfaceGroup>> {
@@ -1219,6 +1284,37 @@ fn interface_has_queue_entries(iface_root: &Path) -> Result<bool> {
     }
 
     Ok(false)
+}
+
+fn queue_entry_count_at(iface_root: &Path, prefix: &str) -> usize {
+    let queue_root = iface_root.join("queues");
+    if !queue_root.exists() {
+        return 0;
+    }
+
+    fs::read_dir(&queue_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .count()
+}
+
+fn queue_value_file_count_at(iface_root: &Path, prefix: &str, value_file: &str) -> usize {
+    let queue_root = iface_root.join("queues");
+    if !queue_root.exists() {
+        return 0;
+    }
+
+    fs::read_dir(&queue_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .filter(|entry| entry.path().join(value_file).exists())
+        .count()
 }
 
 fn split_forwarding_cpus_across_interfaces(
@@ -2605,13 +2701,18 @@ dead:beef
 
         fs::create_dir_all(ens1.join("device")).unwrap();
         fs::create_dir_all(ens1.join("queues/tx-0")).unwrap();
+        fs::write(ens1.join("queues/tx-0/xps_cpus"), "0\n").unwrap();
+        fs::create_dir_all(ens1.join("queues/rx-0")).unwrap();
         fs::create_dir_all(ens2.join("device")).unwrap();
         fs::create_dir_all(ens2.join("queues/tx-0")).unwrap();
+        fs::write(ens2.join("queues/tx-0/xps_cpus"), "0\n").unwrap();
+        fs::create_dir_all(ens2.join("queues/rx-0")).unwrap();
         fs::create_dir_all(ignored.join("queues/tx-0")).unwrap();
 
         let mut cfg = test_config();
         cfg.network.auto_discover = true;
         cfg.network.apply_xps = true;
+        cfg.network.xps_mode = XpsMode::Cpus;
         cfg.policy.forwarding_cpus = vec![0, 2, 4, 6];
 
         let resolved = resolved_network_interfaces_at(&cfg, &root).unwrap();
@@ -2620,6 +2721,43 @@ dead:beef
         assert_eq!(resolved[0].forwarding_cpus, vec![0, 2]);
         assert_eq!(resolved[1].name, "ens2");
         assert_eq!(resolved[1].forwarding_cpus, vec![4, 6]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_discover_reclaims_bridge_group_cpus_from_incompatible_members() {
+        let root = unique_test_dir("auto-discover-bridge-compatible");
+        let br_lan = root.join("br_lan");
+        let ens18 = root.join("ens18");
+        let ens27f1 = root.join("ens27f1");
+        let ens28f0 = root.join("ens28f0");
+
+        fs::create_dir_all(&br_lan).unwrap();
+
+        for iface in [&ens18, &ens27f1, &ens28f0] {
+            fs::create_dir_all(iface.join("device")).unwrap();
+            fs::create_dir_all(iface.join("queues/tx-0")).unwrap();
+            fs::create_dir_all(iface.join("queues/rx-0")).unwrap();
+            fs::write(iface.join("carrier"), "1\n").unwrap();
+        }
+        fs::write(ens27f1.join("queues/tx-0/xps_cpus"), "0\n").unwrap();
+        fs::write(ens28f0.join("queues/tx-0/xps_cpus"), "0\n").unwrap();
+        symlink(&br_lan, ens18.join("master")).unwrap();
+        symlink(&br_lan, ens27f1.join("master")).unwrap();
+
+        let mut cfg = test_config();
+        cfg.network.auto_discover = true;
+        cfg.network.apply_xps = true;
+        cfg.network.xps_mode = XpsMode::Cpus;
+        cfg.policy.forwarding_cpus = vec![0, 1, 2, 3];
+
+        let resolved = resolved_network_interfaces_at(&cfg, &root).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "ens27f1");
+        assert_eq!(resolved[0].forwarding_cpus, vec![0, 1]);
+        assert_eq!(resolved[1].name, "ens28f0");
+        assert_eq!(resolved[1].forwarding_cpus, vec![2, 3]);
 
         fs::remove_dir_all(root).unwrap();
     }
