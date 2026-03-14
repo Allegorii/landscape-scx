@@ -22,9 +22,7 @@ const QID_OWNER_MAP_NAME: &str = "qid_owner_map";
 const TASK_CTX_MAP_NAME: &str = "task_ctx_map";
 // BPF object names are limited to 15 visible bytes; keep the loaded map name short.
 const QUEUE_PRESSURE_MAP_NAME: &str = "qpress_map";
-const HOUSEKEEPING_CPU_MAP_NAME: &str = "hk_cpu_map";
-const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "hk_defcpu_map";
-const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 4;
+const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 5;
 const ACTIVE_CUSTOM_BPF_STATE_PATH: &str = "/run/landscape-scx/custom-bpf-active.toml";
 const CUSTOM_BPF_BPFFS_PREFIX: &str = "landscape-scx-";
 
@@ -60,11 +58,6 @@ struct QueuePressureMapValue {
     pressure_level: u32,
     reserved0: u32,
     reserved1: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HousekeepingDefaultCpuValue {
-    cpu: u32,
 }
 
 pub fn read_sched_ext_state() -> String {
@@ -564,8 +557,6 @@ fn sync_landscape_scheduler_maps_with_previous(
     let qid_owner_path = builtin_qid_owner_map_path(paths);
     let task_ctx_path = builtin_task_ctx_map_path(paths);
     let queue_pressure_path = builtin_queue_pressure_map_path(paths);
-    let housekeeping_cpu_path = builtin_housekeeping_cpu_map_path(paths);
-    let housekeeping_default_path = builtin_housekeeping_default_cpu_map_path(paths);
     let current_qid_owners = qid_owner_entries_from_intent(intent)?;
     let previous_qid_owners =
         previous_intent.map(qid_owner_entries_from_intent).transpose()?.unwrap_or_default();
@@ -575,10 +566,6 @@ fn sync_landscape_scheduler_maps_with_previous(
     let current_queue_pressure = queue_pressure_entries_from_intent(intent);
     let previous_queue_pressure =
         previous_intent.map(queue_pressure_entries_from_intent).unwrap_or_default();
-    let current_housekeeping_cpus = housekeeping_cpu_entries_from_intent(intent)?;
-    let previous_housekeeping_cpus =
-        previous_intent.map(housekeeping_cpu_entries_from_intent).transpose()?.unwrap_or_default();
-    let current_housekeeping_default = housekeeping_default_cpu_from_intent(intent)?;
 
     for (owner_cpu, value) in &current_qid_owners {
         bpftool_map_update_pinned(
@@ -618,21 +605,6 @@ fn sync_landscape_scheduler_maps_with_previous(
             bpftool_map_delete_pinned(&queue_pressure_path, &qid.to_ne_bytes())?;
         }
     }
-
-    for (cpu, value) in &current_housekeeping_cpus {
-        bpftool_map_update_pinned(&housekeeping_cpu_path, &cpu.to_ne_bytes(), &[*value])?;
-    }
-    for cpu in previous_housekeeping_cpus.keys() {
-        if !current_housekeeping_cpus.contains_key(cpu) {
-            bpftool_map_delete_pinned(&housekeeping_cpu_path, &cpu.to_ne_bytes())?;
-        }
-    }
-
-    bpftool_map_update_pinned(
-        &housekeeping_default_path,
-        &0u32.to_ne_bytes(),
-        &housekeeping_default_cpu_value_bytes(current_housekeeping_default),
-    )?;
 
     Ok(())
 }
@@ -691,28 +663,6 @@ fn queue_pressure_entries_from_intent(
         .collect()
 }
 
-fn housekeeping_cpu_entries_from_intent(
-    intent: &LandscapeSchedulerIntent,
-) -> Result<BTreeMap<u32, u8>> {
-    let mut entries = BTreeMap::new();
-    for cpu in &intent.housekeeping_cpus {
-        let cpu = u32::try_from(*cpu).context("housekeeping cpu does not fit into u32")?;
-        entries.insert(cpu, 1u8);
-    }
-    Ok(entries)
-}
-
-fn housekeeping_default_cpu_from_intent(
-    intent: &LandscapeSchedulerIntent,
-) -> Result<HousekeepingDefaultCpuValue> {
-    let Some(cpu) = intent.housekeeping_cpus.first() else {
-        anyhow::bail!("built-in scheduler intent requires at least one housekeeping cpu");
-    };
-    Ok(HousekeepingDefaultCpuValue {
-        cpu: u32::try_from(*cpu).context("housekeeping default cpu does not fit into u32")?,
-    })
-}
-
 fn task_flags(task: &LandscapeTaskIntent) -> u32 {
     match task.class {
         LandscapeTaskClass::DataplaneStrict | LandscapeTaskClass::DataplaneShared => {
@@ -741,14 +691,6 @@ fn pin_landscape_scheduler_maps(paths: &BuiltinSchedulerPaths) -> Result<()> {
     pin_landscape_scheduler_map_by_name(
         QUEUE_PRESSURE_MAP_NAME,
         &builtin_queue_pressure_map_path(paths),
-    )?;
-    pin_landscape_scheduler_map_by_name(
-        HOUSEKEEPING_CPU_MAP_NAME,
-        &builtin_housekeeping_cpu_map_path(paths),
-    )?;
-    pin_landscape_scheduler_map_by_name(
-        HOUSEKEEPING_DEFAULT_CPU_MAP_NAME,
-        &builtin_housekeeping_default_cpu_map_path(paths),
     )?;
     Ok(())
 }
@@ -896,10 +838,6 @@ fn queue_pressure_value_bytes(value: QueuePressureMapValue) -> Vec<u8> {
     bytes
 }
 
-fn housekeeping_default_cpu_value_bytes(value: HousekeepingDefaultCpuValue) -> Vec<u8> {
-    value.cpu.to_ne_bytes().to_vec()
-}
-
 fn task_key_bytes(task_key: &LandscapeTaskKey) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(16);
     bytes.extend_from_slice(
@@ -924,8 +862,6 @@ fn builtin_map_pins_ready(paths: &BuiltinSchedulerPaths) -> bool {
     builtin_qid_owner_map_path(paths).exists()
         && builtin_task_ctx_map_path(paths).exists()
         && builtin_queue_pressure_map_path(paths).exists()
-        && builtin_housekeeping_cpu_map_path(paths).exists()
-        && builtin_housekeeping_default_cpu_map_path(paths).exists()
 }
 
 fn builtin_qid_owner_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
@@ -938,14 +874,6 @@ fn builtin_task_ctx_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
 
 fn builtin_queue_pressure_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
     builtin_map_dir(paths).join(QUEUE_PRESSURE_MAP_NAME)
-}
-
-fn builtin_housekeeping_cpu_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
-    builtin_map_dir(paths).join(HOUSEKEEPING_CPU_MAP_NAME)
-}
-
-fn builtin_housekeeping_default_cpu_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
-    builtin_map_dir(paths).join(HOUSEKEEPING_DEFAULT_CPU_MAP_NAME)
 }
 
 fn write_runtime_state(path: &Path, state: &LandscapeSchedulerStaticState) -> Result<()> {
