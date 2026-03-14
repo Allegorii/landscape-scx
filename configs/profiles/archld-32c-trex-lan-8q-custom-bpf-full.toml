@@ -35,15 +35,15 @@ clear_inactive_xps = true
 queue_mapping_mode = "round_robin"
 xps_mode = "cpus"
 interfaces = [
-  { name = "ens27f0", forwarding_cpus = [0, 2, 3, 6, 7, 8, 10, 14], active_queue_count = 8, xps_mode = "cpus" },
-  { name = "ens16f1np1", forwarding_cpus = [11, 16, 18, 21, 23, 24, 28, 30], active_queue_count = 8, xps_mode = "cpus" },
+  { name = "ens28f0", forwarding_cpus = [0, 2, 3, 6, 7, 8, 10, 14], active_queue_count = 8, xps_mode = "cpus" },
+  { name = "ens28f1", forwarding_cpus = [11, 16, 18, 21, 23, 24, 28, 30], active_queue_count = 8, xps_mode = "cpus" },
 ]
 
 [scheduler]
 mode = "custom_bpf"
 start_command = []
 stop_command = []
-pid_file = "/run/landscape-scx/archld-custom-bpf-full-trex-l3.pid"
+pid_file = "/run/landscape-scx/archld-custom-bpf-full-trex-lan.pid"
 ready_timeout_ms = 5000
 fallback_on_error = false
 
@@ -52,8 +52,8 @@ switch_mode = "full"
 housekeeping_cpus = [1, 4, 5, 9, 12, 13, 15, 17, 19, 20, 22, 25, 26, 27, 29, 31]
 forwarding_thread_prefixes = ["landscape_pppoe", "pppoe-rx-", "landscape-forwarder"]
 source_file = "./bpf/landscape_scx.bpf.c"
-build_dir = "/run/landscape-scx/archld-32c-dualwan-8q-custom-bpf-full-trex-l3"
-link_dir = "/sys/fs/bpf/landscape-scx-archld-32c-dualwan-8q-full-trex-l3"
+build_dir = "/run/landscape-scx/archld-32c-trex-lan-8q-custom-bpf-full"
+link_dir = "/sys/fs/bpf/landscape-scx-archld-32c-trex-lan-8q-full"
 
 [agent]
 apply_interval_secs = 5
