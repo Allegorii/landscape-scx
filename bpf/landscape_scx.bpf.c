@@ -17,6 +17,7 @@
 #define LANDSCAPE_MAX_TASKS 4096
 #define LANDSCAPE_DSQ_BASE 0x1000ULL
 #define LANDSCAPE_HOUSEKEEPING_DSQ 0x2000ULL
+#define LANDSCAPE_SOFTIRQ_DSQ_BASE 0x3000ULL
 #define LANDSCAPE_TASK_F_DATAPLANE (1U << 0)
 #define LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT 0U
 #define LANDSCAPE_TASK_CLASS_DATAPLANE_SHARED 1U
@@ -113,6 +114,11 @@ static __always_inline __u64 task_start_time_ns(struct task_struct *p)
 static __always_inline __u64 dsq_for_qid(__u32 qid)
 {
 	return LANDSCAPE_DSQ_BASE + qid;
+}
+
+static __always_inline __u64 softirq_dsq_for_qid(__u32 qid)
+{
+	return LANDSCAPE_SOFTIRQ_DSQ_BASE + qid;
 }
 
 static __always_inline bool task_class_is_dataplane(__u32 task_class)
@@ -249,15 +255,13 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 	if (lookup_task_ctx(p, &task)) {
 		if (task_is_dataplane(&task)) {
 			/*
-			 * Per-CPU kthreads such as ksoftirqd don't reliably go
-			 * through select_cpu() and thus can't be directly sent
-			 * to another CPU's local DSQ from enqueue(). Keep them
-			 * on their owner queue, but force head-of-line service
-			 * and kick the owner CPU into the scheduling path so
-			 * queue-bound workers can't starve softirq progress.
+			 * Per-CPU kthreads such as ksoftirqd need a separate
+			 * queue from forwarding workers. Sharing a FIFO DSQ lets
+			 * queue-bound userspace workers starve softirq progress
+			 * long enough to trip sched_ext's watchdog.
 			 */
 			if (task_is_percpu_kthread(p)) {
-				scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), SCX_SLICE_DFL,
+				scx_bpf_dsq_insert(p, softirq_dsq_for_qid(task.qid), SCX_SLICE_DFL,
 						 enq_flags | SCX_ENQ_HEAD);
 				scx_bpf_kick_cpu((s32)task.owner_cpu, SCX_KICK_PREEMPT);
 				return 0;
@@ -284,8 +288,13 @@ s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
 	struct landscape_queue_owner_ctx *queue;
 
 	queue = bpf_map_lookup_elem(&qid_owner_map, &owner_cpu);
-	if (queue && scx_bpf_dsq_move_to_local(queue->dsq_id))
-		return 0;
+	if (queue) {
+		if (scx_bpf_dsq_move_to_local(softirq_dsq_for_qid(queue->qid)))
+			return 0;
+
+		if (scx_bpf_dsq_move_to_local(queue->dsq_id))
+			return 0;
+	}
 
 	if (queue && queue_pressure_level(queue->qid) >= LANDSCAPE_PRESSURE_LEVEL_ELEVATED)
 		return 0;
@@ -310,8 +319,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(landscape_init)
 	__u32 qid;
 
 #pragma clang loop unroll(disable)
-	for (qid = 0; qid < LANDSCAPE_MAX_QIDS; qid++)
+	for (qid = 0; qid < LANDSCAPE_MAX_QIDS; qid++) {
 		scx_bpf_create_dsq(dsq_for_qid(qid), -1);
+		scx_bpf_create_dsq(softirq_dsq_for_qid(qid), -1);
+	}
 	scx_bpf_create_dsq(LANDSCAPE_HOUSEKEEPING_DSQ, -1);
 
 	return 0;
