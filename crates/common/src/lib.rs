@@ -1300,8 +1300,10 @@ fn interface_has_carrier(iface_root: &Path) -> Result<bool> {
         return Ok(true);
     }
 
-    let carrier = fs::read_to_string(&carrier_path)
-        .with_context(|| format!("failed to read {}", carrier_path.display()))?;
+    let carrier = match fs::read_to_string(&carrier_path) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
     Ok(carrier.trim() != "0")
 }
 

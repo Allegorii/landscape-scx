@@ -39,13 +39,20 @@ rps_mode = "auto"
 active_queue_count = 0
 
 [scheduler]
-# Safe validation profile: keep CFS in charge until the auto-discovery result is verified.
-mode = "disabled"
+# Automatically run the built-in landscape custom BPF scheduler.
+mode = "custom_bpf"
 start_command = []
 stop_command = []
-pid_file = "/run/landscape-scx/auto-discover-auto-partition.pid"
-ready_timeout_ms = 0
+pid_file = "/run/landscape-scx/auto-discover-auto-partition-custom-bpf.pid"
+ready_timeout_ms = 5000
 fallback_on_error = false
+
+[scheduler.custom_bpf]
+switch_mode = "full"
+forwarding_thread_prefixes = ["pppd", "landscape_pppoe", "pppoe-rx-", "landscape-forwarder"]
+source_file = "./bpf/landscape_scx.bpf.c"
+build_dir = "/run/landscape-scx/auto-discover-auto-partition-custom-bpf"
+link_dir = "/sys/fs/bpf/landscape-scx-auto-discover-auto-partition"
 
 [agent]
 apply_interval_secs = 5
