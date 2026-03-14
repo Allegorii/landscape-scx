@@ -824,6 +824,7 @@ fn reconcile_once_with_pressure(
                 print!("{}", format_builtin_pressure_report(report));
             }
         } else {
+            reset_stale_builtin_sched_ext_threads(&prepared.intent, &prepared.candidates)?;
             ensure_landscape_scheduler_with_fallback(cfg, &prepared.intent)?;
         }
 
@@ -2234,6 +2235,13 @@ enum SchedPolicyUpdate {
     Skip,
 }
 
+fn should_reset_builtin_stale_sched_ext(
+    task_in_intent: bool,
+    current_policy: Option<i32>,
+) -> bool {
+    !task_in_intent && current_policy == Some(SCHED_EXT_POLICY as i32)
+}
+
 fn desired_sched_policy_update(
     current_policy: Option<i32>,
     action: &ThreadPolicyAction,
@@ -2247,6 +2255,54 @@ fn desired_sched_policy_update(
     }
 
     SchedPolicyUpdate::Skip
+}
+
+fn reset_stale_builtin_sched_ext_threads(
+    intent: &LandscapeSchedulerIntent,
+    candidates: &[ThreadCandidate],
+) -> Result<()> {
+    let task_keys = intent.tasks.iter().map(|task| task.key()).collect::<BTreeSet<_>>();
+    let mut reset_ok = 0usize;
+    let mut reset_fail = 0usize;
+
+    for candidate in candidates {
+        let current_policy = get_sched_policy(candidate.tid).ok();
+        if !should_reset_builtin_stale_sched_ext(
+            task_keys.contains(&candidate.task_key()),
+            current_policy,
+        ) {
+            continue;
+        }
+
+        match try_set_sched_other(candidate.tid) {
+            Ok(_) => {
+                reset_ok += 1;
+            }
+            Err(err) => {
+                reset_fail += 1;
+                warn!(
+                    "failed to reset stale builtin tid={} comm={} to SCHED_OTHER err={}",
+                    candidate.tid,
+                    candidate.comm,
+                    err
+                );
+            }
+        }
+    }
+
+    if reset_ok > 0 || reset_fail > 0 {
+        info!(
+            "builtin stale sched_ext cleanup finished: sched_other_success={} sched_other_failed={}",
+            reset_ok,
+            reset_fail
+        );
+    }
+
+    if reset_fail > 0 {
+        warn!("some stale builtin sched_ext threads were not reset");
+    }
+
+    Ok(())
 }
 
 fn builtin_task_policy_action(cfg: &ScxConfig, task: &LandscapeTaskIntent) -> ThreadPolicyAction {
@@ -2368,10 +2424,11 @@ mod tests {
     use super::{
         apply_builtin_queue_pressure, build_landscape_scheduler_intent, builtin_task_policy_action,
         collect_irq_totals, collect_reconcile_watch_targets, derive_queue_pressure_levels,
-        desired_sched_policy_update, parse_proc_connector_event_scope, thread_policy_action,
-        BuiltinPressureTracker, ExecProcEvent, ForkProcEvent, ProcEventHeader, ScxConfig,
-        SchedPolicyUpdate, SoftirqTotals, SoftnetCpuCounters, ThreadCpuClass,
-        PROC_EVENT_EXEC, PROC_EVENT_FORK, QUEUE_PRESSURE_LEVEL_ELEVATED,
+        desired_sched_policy_update, parse_proc_connector_event_scope,
+        should_reset_builtin_stale_sched_ext, thread_policy_action, BuiltinPressureTracker,
+        ExecProcEvent, ForkProcEvent, ProcEventHeader, ScxConfig, SchedPolicyUpdate,
+        SoftirqTotals, SoftnetCpuCounters, ThreadCpuClass, PROC_EVENT_EXEC,
+        PROC_EVENT_FORK, QUEUE_PRESSURE_LEVEL_ELEVATED,
         QUEUE_PRESSURE_LEVEL_HIGH,
     };
     use landscape_scx_common::{
@@ -2640,6 +2697,16 @@ mod tests {
             SchedPolicyUpdate::ResetOther
         );
         assert_eq!(desired_sched_policy_update(Some(libc::SCHED_OTHER), &action), SchedPolicyUpdate::Skip);
+    }
+
+    #[test]
+    fn builtin_removed_task_is_treated_as_stale_sched_ext() {
+        assert!(should_reset_builtin_stale_sched_ext(
+            false,
+            Some(landscape_scx_common::SCHED_EXT_POLICY as i32)
+        ));
+        assert!(!should_reset_builtin_stale_sched_ext(false, Some(libc::SCHED_OTHER)));
+        assert!(!should_reset_builtin_stale_sched_ext(true, Some(landscape_scx_common::SCHED_EXT_POLICY as i32)));
     }
 
     fn test_pressure_plan(total_q0: u64, total_q1: u64) -> InterfaceLocalityPlan {
