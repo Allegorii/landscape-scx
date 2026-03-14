@@ -964,6 +964,7 @@ pub struct IrqAffinityAction {
 #[derive(Debug, Clone)]
 struct ResolvedNetworkInterface {
     name: String,
+    auto_discovered: bool,
     forwarding_cpus: Vec<usize>,
     active_queue_count: usize,
     apply_rss_equal: bool,
@@ -1011,6 +1012,7 @@ impl NetworkInterfaceSpec {
             NetworkInterfaceSpec::Name(name) => {
                 let mut resolved = ResolvedNetworkInterface {
                     name: name.clone(),
+                    auto_discovered: false,
                     forwarding_cpus,
                     active_queue_count: network.active_queue_count,
                     apply_rss_equal: network.apply_rss_equal,
@@ -1027,6 +1029,7 @@ impl NetworkInterfaceSpec {
             NetworkInterfaceSpec::Config(iface_cfg) => {
                 let mut resolved = ResolvedNetworkInterface {
                     name: iface_cfg.name.clone(),
+                    auto_discovered: false,
                     forwarding_cpus: if iface_cfg.forwarding_cpus.is_empty() {
                         forwarding_cpus
                     } else {
@@ -1107,6 +1110,7 @@ fn auto_discovered_network_interfaces(
         for (name, forwarding_cpus) in group.members.into_iter().zip(member_cpu_sets.into_iter()) {
             let mut resolved = ResolvedNetworkInterface {
                 name,
+                auto_discovered: true,
                 forwarding_cpus,
                 active_queue_count: network.active_queue_count,
                 apply_rss_equal: network.apply_rss_equal,
@@ -1354,29 +1358,65 @@ pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLoca
 
     for iface in resolved_network_interfaces(cfg)? {
         let initial_mode = iface.xps_mode.clone();
-        let initial_status = read_interface_locality_status(&iface)?;
+        let initial_status = match read_interface_locality_status(&iface) {
+            Ok(status) => status,
+            Err(_err) if iface.auto_discovered => continue,
+            Err(err) => return Err(err),
+        };
         let iface = adapt_xps_mode_to_interface_support(iface, &initial_status);
         let status = if iface.xps_mode == initial_mode {
             initial_status
         } else {
-            read_interface_locality_status(&iface)?
+            match read_interface_locality_status(&iface) {
+                Ok(status) => status,
+                Err(_err) if iface.auto_discovered => continue,
+                Err(err) => return Err(err),
+            }
         };
-        let active_queue_count = effective_active_queue_count(cfg, &iface, &status)?;
-        let channel_action = build_channel_action(&iface, &status, active_queue_count)?;
-        let rss_action = build_rss_equal_action(&iface, &status, active_queue_count)?;
-        let rps_actions = build_interface_rps_actions(&iface, &status, active_queue_count)?;
+        let active_queue_count = match effective_active_queue_count(cfg, &iface, &status) {
+            Ok(count) => count,
+            Err(_err) if iface.auto_discovered => continue,
+            Err(err) => return Err(err),
+        };
+        let channel_action = match build_channel_action(&iface, &status, active_queue_count) {
+            Ok(action) => action,
+            Err(_err) if iface.auto_discovered => continue,
+            Err(err) => return Err(err),
+        };
+        let rss_action = match build_rss_equal_action(&iface, &status, active_queue_count) {
+            Ok(action) => action,
+            Err(_err) if iface.auto_discovered => continue,
+            Err(err) => return Err(err),
+        };
+        let rps_actions = match build_interface_rps_actions(&iface, &status, active_queue_count) {
+            Ok(actions) => actions,
+            Err(_err) if iface.auto_discovered => continue,
+            Err(err) => return Err(err),
+        };
         let xps_actions = if cfg.network.apply_xps {
-            build_interface_xps_actions(&iface, &status, active_queue_count)?
+            match build_interface_xps_actions(&iface, &status, active_queue_count) {
+                Ok(actions) => actions,
+                Err(_err) if iface.auto_discovered => continue,
+                Err(err) => return Err(err),
+            }
         } else {
             Vec::new()
         };
         let inactive_xps_actions = if iface.clear_inactive_xps {
-            build_inactive_xps_actions(&status, active_queue_count)?
+            match build_inactive_xps_actions(&status, active_queue_count) {
+                Ok(actions) => actions,
+                Err(_err) if iface.auto_discovered => continue,
+                Err(err) => return Err(err),
+            }
         } else {
             Vec::new()
         };
         let irq_actions = if cfg.network.apply_irq_affinity {
-            build_interface_irq_actions(&iface, &status, active_queue_count)?
+            match build_interface_irq_actions(&iface, &status, active_queue_count) {
+                Ok(actions) => actions,
+                Err(_err) if iface.auto_discovered => continue,
+                Err(err) => return Err(err),
+            }
         } else {
             Vec::new()
         };
@@ -2202,6 +2242,7 @@ fn validate_network_config(cfg: &ScxConfig) -> Result<()> {
         anyhow::bail!("network.auto_discover is enabled, but no manageable interfaces were found");
     }
 
+    let mut validated_interfaces = 0usize;
     for iface in resolved {
         validate_optional_cpu_set(
             &format!("network.interfaces[{}].forwarding_cpus", iface.name),
@@ -2218,8 +2259,24 @@ fn validate_network_config(cfg: &ScxConfig) -> Result<()> {
             );
         }
 
-        let status = read_interface_locality_status(&iface)?;
-        let _ = effective_active_queue_count(cfg, &iface, &status)?;
+        let status = match read_interface_locality_status(&iface) {
+            Ok(status) => status,
+            Err(_err) if iface.auto_discovered => continue,
+            Err(err) => return Err(err),
+        };
+        match effective_active_queue_count(cfg, &iface, &status) {
+            Ok(_) => {
+                validated_interfaces += 1;
+            }
+            Err(_err) if iface.auto_discovered => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    if manages_network_locality && validated_interfaces == 0 {
+        anyhow::bail!(
+            "network locality management is enabled, but auto-discovery found no interfaces compatible with the requested locality mode"
+        );
     }
 
     Ok(())
@@ -2635,6 +2692,7 @@ dead:beef
         let cfg = test_config();
         let iface = ResolvedNetworkInterface {
             name: "eth0".into(),
+            auto_discovered: false,
             forwarding_cpus: vec![9000, 9001, 9002],
             active_queue_count: 0,
             apply_rss_equal: false,
@@ -2669,6 +2727,7 @@ dead:beef
     fn auto_rps_mode_disables_rps_when_rss_is_aligned() {
         let iface = ResolvedNetworkInterface {
             name: "eth0".into(),
+            auto_discovered: false,
             forwarding_cpus: vec![0, 1],
             active_queue_count: 0,
             apply_rss_equal: true,
