@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -395,6 +395,12 @@ fn default_control_cpus() -> Vec<usize> {
 struct ResolvedPolicyCpuSets {
     forwarding_cpus: Vec<usize>,
     control_cpus: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoDiscoveredInterfaceGroup {
+    key: String,
+    members: Vec<String>,
 }
 
 const fn default_enable_ksoftirqd() -> bool {
@@ -1085,38 +1091,42 @@ fn auto_discovered_network_interfaces(
     cfg: &ScxConfig,
     sys_class_net: &Path,
 ) -> Result<Vec<ResolvedNetworkInterface>> {
-    let names = discover_auto_network_interface_names(sys_class_net)?;
-    if names.is_empty() {
+    let groups = discover_auto_network_interface_groups(sys_class_net)?;
+    if groups.is_empty() {
         return Ok(Vec::new());
     }
 
     let forwarding_cpu_sets =
-        split_forwarding_cpus_across_interfaces(&effective_forwarding_cpus(cfg)?, names.len())?;
+        split_forwarding_cpus_across_interfaces(&effective_forwarding_cpus(cfg)?, groups.len())?;
     let network = &cfg.network;
-    let mut out = Vec::with_capacity(names.len());
+    let mut out = Vec::new();
 
-    for (name, forwarding_cpus) in names.into_iter().zip(forwarding_cpu_sets.into_iter()) {
-        let mut resolved = ResolvedNetworkInterface {
-            name,
-            forwarding_cpus,
-            active_queue_count: network.active_queue_count,
-            apply_rss_equal: network.apply_rss_equal,
-            apply_combined_channels: network.apply_combined_channels,
-            clear_inactive_xps: network.clear_inactive_xps,
-            queue_mapping_mode: network.queue_mapping_mode.clone(),
-            requested_xps_mode: network.xps_mode.clone(),
-            xps_mode: network.xps_mode.clone(),
-            rps_mode: network.rps_mode.clone(),
-        };
-        resolved.xps_mode = effective_xps_mode(cfg, &resolved);
-        out.push(resolved);
+    for (group, group_forwarding_cpus) in groups.into_iter().zip(forwarding_cpu_sets.into_iter()) {
+        let member_cpu_sets =
+            split_group_forwarding_cpus_across_members(&group_forwarding_cpus, group.members.len());
+        for (name, forwarding_cpus) in group.members.into_iter().zip(member_cpu_sets.into_iter()) {
+            let mut resolved = ResolvedNetworkInterface {
+                name,
+                forwarding_cpus,
+                active_queue_count: network.active_queue_count,
+                apply_rss_equal: network.apply_rss_equal,
+                apply_combined_channels: network.apply_combined_channels,
+                clear_inactive_xps: network.clear_inactive_xps,
+                queue_mapping_mode: network.queue_mapping_mode.clone(),
+                requested_xps_mode: network.xps_mode.clone(),
+                xps_mode: network.xps_mode.clone(),
+                rps_mode: network.rps_mode.clone(),
+            };
+            resolved.xps_mode = effective_xps_mode(cfg, &resolved);
+            out.push(resolved);
+        }
     }
 
     Ok(out)
 }
 
-fn discover_auto_network_interface_names(sys_class_net: &Path) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+fn discover_auto_network_interface_groups(sys_class_net: &Path) -> Result<Vec<AutoDiscoveredInterfaceGroup>> {
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
 
     for entry in fs::read_dir(sys_class_net)
         .with_context(|| format!("failed to read {}", sys_class_net.display()))?
@@ -1127,12 +1137,34 @@ fn discover_auto_network_interface_names(sys_class_net: &Path) -> Result<Vec<Str
         };
         let name = entry.file_name().to_string_lossy().to_string();
         if interface_is_auto_discoverable(&name, &entry.path())? {
-            out.push(name);
+            let key = auto_discover_group_key(&name, &entry.path())?;
+            groups.entry(key).or_default().push(name);
         }
     }
 
-    out.sort();
+    let mut out = groups
+        .into_iter()
+        .map(|(key, mut members)| {
+            members.sort();
+            AutoDiscoveredInterfaceGroup { key, members }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(out)
+}
+
+fn auto_discover_group_key(name: &str, iface_root: &Path) -> Result<String> {
+    let master_path = iface_root.join("master");
+    if !master_path.exists() {
+        return Ok(name.to_string());
+    }
+
+    let target = fs::read_link(&master_path)
+        .with_context(|| format!("failed to read {}", master_path.display()))?;
+    let Some(master_name) = target.file_name().and_then(|value| value.to_str()) else {
+        return Ok(name.to_string());
+    };
+    Ok(master_name.to_string())
 }
 
 fn interface_is_auto_discoverable(name: &str, iface_root: &Path) -> Result<bool> {
@@ -1142,11 +1174,25 @@ fn interface_is_auto_discoverable(name: &str, iface_root: &Path) -> Result<bool>
     if !iface_root.join("device").exists() {
         return Ok(false);
     }
-    if iface_root.join("master").exists() || iface_root.join("bridge").exists() {
+    if iface_root.join("bridge").exists() {
+        return Ok(false);
+    }
+    if !interface_has_carrier(iface_root)? {
         return Ok(false);
     }
 
     interface_has_queue_entries(iface_root)
+}
+
+fn interface_has_carrier(iface_root: &Path) -> Result<bool> {
+    let carrier_path = iface_root.join("carrier");
+    if !carrier_path.exists() {
+        return Ok(true);
+    }
+
+    let carrier = fs::read_to_string(&carrier_path)
+        .with_context(|| format!("failed to read {}", carrier_path.display()))?;
+    Ok(carrier.trim() != "0")
 }
 
 fn interface_has_queue_entries(iface_root: &Path) -> Result<bool> {
@@ -1198,6 +1244,26 @@ fn split_forwarding_cpus_across_interfaces(
     }
 
     Ok(out)
+}
+
+fn split_group_forwarding_cpus_across_members(
+    forwarding_cpus: &[usize],
+    member_count: usize,
+) -> Vec<Vec<usize>> {
+    if member_count == 0 {
+        return Vec::new();
+    }
+    if forwarding_cpus.is_empty() {
+        return vec![Vec::new(); member_count];
+    }
+    if forwarding_cpus.len() >= member_count {
+        return split_forwarding_cpus_across_interfaces(forwarding_cpus, member_count)
+            .unwrap_or_else(|_| forwarding_cpus.iter().copied().map(|cpu| vec![cpu]).collect());
+    }
+
+    (0..member_count)
+        .map(|idx| vec![forwarding_cpus[idx % forwarding_cpus.len()]])
+        .collect()
 }
 
 fn effective_xps_mode(cfg: &ScxConfig, iface: &ResolvedNetworkInterface) -> XpsMode {
@@ -2188,13 +2254,14 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         affinity_list_matches, auto_partition_cpu_sets_from_core_groups, build_interface_rps_actions,
-        cpu_list_string, cpu_mask_string, effective_active_queue_count,
-        interface_is_auto_discoverable, matches_target, parse_cpu_mask,
+        cpu_list_string, cpu_mask_string, discover_auto_network_interface_groups,
+        effective_active_queue_count, interface_is_auto_discoverable, matches_target, parse_cpu_mask,
         parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
         parse_ksoftirqd_cpu, resolved_network_interfaces, resolved_network_interfaces_at,
         rss_equal_matches, split_forwarding_cpus_across_interfaces, xps_mask_matches,
@@ -2447,20 +2514,26 @@ dead:beef
         let root = unique_test_dir("auto-discover-eligible");
         let phys = root.join("ens1");
         let loopback = root.join("lo");
-        let bridged = root.join("ens2");
+        let bridge_member = root.join("ens2");
+        let bridge_master = root.join("br_lan");
         let virtual_iface = root.join("veth0");
 
         fs::create_dir_all(phys.join("device")).unwrap();
         fs::create_dir_all(phys.join("queues/tx-0")).unwrap();
+        fs::write(phys.join("carrier"), "1\n").unwrap();
         fs::create_dir_all(loopback.join("queues/tx-0")).unwrap();
-        fs::create_dir_all(bridged.join("device")).unwrap();
-        fs::create_dir_all(bridged.join("master")).unwrap();
-        fs::create_dir_all(bridged.join("queues/tx-0")).unwrap();
+        fs::create_dir_all(bridge_member.join("device")).unwrap();
+        fs::create_dir_all(bridge_member.join("queues/tx-0")).unwrap();
+        fs::write(bridge_member.join("carrier"), "1\n").unwrap();
+        fs::create_dir_all(bridge_master.join("device")).unwrap();
+        fs::create_dir_all(bridge_master.join("bridge")).unwrap();
+        fs::create_dir_all(bridge_master.join("queues/tx-0")).unwrap();
         fs::create_dir_all(virtual_iface.join("queues/tx-0")).unwrap();
 
         assert!(interface_is_auto_discoverable("ens1", &phys).unwrap());
         assert!(!interface_is_auto_discoverable("lo", &loopback).unwrap());
-        assert!(!interface_is_auto_discoverable("ens2", &bridged).unwrap());
+        assert!(interface_is_auto_discoverable("ens2", &bridge_member).unwrap());
+        assert!(!interface_is_auto_discoverable("br_lan", &bridge_master).unwrap());
         assert!(!interface_is_auto_discoverable("veth0", &virtual_iface).unwrap());
 
         fs::remove_dir_all(root).unwrap();
@@ -2498,6 +2571,39 @@ dead:beef
     fn auto_discover_requires_enough_forwarding_cpus() {
         let err = split_forwarding_cpus_across_interfaces(&[0, 1], 3).unwrap_err().to_string();
         assert!(err.contains("network.auto_discover found 3 interfaces"));
+    }
+
+    #[test]
+    fn auto_discover_groups_bridge_members_and_skips_no_carrier_slaves() {
+        let root = unique_test_dir("auto-discover-bridge-group");
+        let br_lan = root.join("br_lan");
+        let ens18 = root.join("ens18");
+        let ens27f1 = root.join("ens27f1");
+        let ens17 = root.join("ens17");
+        let ens28f0 = root.join("ens28f0");
+
+        fs::create_dir_all(&br_lan).unwrap();
+
+        for iface in [&ens18, &ens27f1, &ens17, &ens28f0] {
+            fs::create_dir_all(iface.join("device")).unwrap();
+            fs::create_dir_all(iface.join("queues/tx-0")).unwrap();
+        }
+        fs::write(ens18.join("carrier"), "1\n").unwrap();
+        fs::write(ens27f1.join("carrier"), "1\n").unwrap();
+        fs::write(ens17.join("carrier"), "0\n").unwrap();
+        fs::write(ens28f0.join("carrier"), "1\n").unwrap();
+        symlink(&br_lan, ens18.join("master")).unwrap();
+        symlink(&br_lan, ens27f1.join("master")).unwrap();
+        symlink(&br_lan, ens17.join("master")).unwrap();
+
+        let groups = discover_auto_network_interface_groups(&root).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].key, "br_lan");
+        assert_eq!(groups[0].members, vec!["ens18".to_string(), "ens27f1".to_string()]);
+        assert_eq!(groups[1].key, "ens28f0");
+        assert_eq!(groups[1].members, vec!["ens28f0".to_string()]);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
