@@ -1,0 +1,56 @@
+[discovery]
+process_names = ["pppd"]
+cmdline_keywords = ["landscape-webserver"]
+cgroup_prefixes = ["/system.slice/landscape-router.service"]
+thread_include_prefixes = [
+  "ksoftirqd/",
+  "tokio-runtime-w",
+  "sqlx-sqlite-wor",
+  "r2d2-worker-",
+  "metric-db-threa",
+  "landscape-webse",
+  "pppd",
+]
+
+[policy]
+# Host-specific 8-queue pure LAN forwarding baseline for TRex L3 tests.
+# - ens28f0 dataplane island: 0,2,3,6,7,8,10,14
+# - ens28f1 dataplane island: 11,16,18,21,23,24,28,30
+# - baseline scheduler remains scx_cosmos so the only topology change is the
+#   LAN interface pair, not the scheduler family.
+forwarding_cpus = [0, 2, 3, 6, 7, 8, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30]
+control_cpus = [1, 4, 5, 9, 12, 13, 15, 17, 19, 20, 22, 25, 26, 27, 29, 31]
+manage_ksoftirqd = true
+ksoftirqd_cpus = [0, 2, 3, 6, 7, 8, 10, 11, 14, 16, 18, 21, 23, 24, 28, 30]
+apply_sched_ext = false
+thread_cpu_classes = [
+  { thread_name_prefix = "ksoftirqd/", cpus = [], apply_sched_ext = true, apply_affinity = false },
+  { thread_name_prefix = "sqlx-sqlite-wor", cpus = [25], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "r2d2-worker-", cpus = [26, 27], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "metric-db-threa", cpus = [29], apply_sched_ext = false, apply_affinity = true },
+  { thread_name_prefix = "pppd", cpus = [20], apply_sched_ext = false, apply_affinity = true },
+]
+
+[network]
+apply_irq_affinity = true
+apply_xps = true
+apply_rss_equal = true
+apply_combined_channels = true
+clear_inactive_xps = true
+queue_mapping_mode = "round_robin"
+xps_mode = "cpus"
+interfaces = [
+  { name = "ens28f0", forwarding_cpus = [0, 2, 3, 6, 7, 8, 10, 14], active_queue_count = 8, xps_mode = "cpus" },
+  { name = "ens28f1", forwarding_cpus = [11, 16, 18, 21, 23, 24, 28, 30], active_queue_count = 8, xps_mode = "cpus" },
+]
+
+[scheduler]
+mode = "external_command"
+start_command = ["scx_cosmos"]
+stop_command = []
+pid_file = "/run/landscape-scx/archld-trex-lan-8q-cosmos.pid"
+ready_timeout_ms = 3000
+fallback_on_error = true
+
+[agent]
+apply_interval_secs = 5
