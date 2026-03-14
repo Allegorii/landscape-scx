@@ -668,14 +668,9 @@ fn auto_partition_cpu_sets_from_core_groups(core_groups: &[Vec<usize>]) -> (Vec<
         return (Vec::new(), Vec::new());
     }
 
-    let has_smt = core_groups.iter().any(|group| group.len() > 1);
-    if has_smt {
-        let forwarding_cpus: Vec<usize> =
-            core_groups.iter().filter_map(|group| group.first().copied()).collect();
-        let mut control_cpus = core_groups
-            .iter()
-            .flat_map(|group| group.iter().skip(1).copied())
-            .collect::<Vec<_>>();
+    if core_groups.len() == 1 {
+        let forwarding_cpus = core_groups[0].first().copied().into_iter().collect::<Vec<_>>();
+        let mut control_cpus = core_groups[0].iter().skip(1).copied().collect::<Vec<_>>();
         if control_cpus.is_empty() {
             control_cpus = forwarding_cpus.clone();
         }
@@ -685,6 +680,9 @@ fn auto_partition_cpu_sets_from_core_groups(core_groups: &[Vec<usize>]) -> (Vec<
     let reserve_groups = if core_groups.len() <= 1 { 0 } else { (core_groups.len() / 4).max(1) };
     let split_at = core_groups.len().saturating_sub(reserve_groups);
 
+    // Keep forwarding and control on separate physical cores by default. On SMT
+    // systems forwarding uses one sibling per core and leaves the paired sibling
+    // unused unless that whole core is assigned to housekeeping/control.
     let mut forwarding_cpus = core_groups
         .iter()
         .take(split_at)
@@ -2503,11 +2501,11 @@ dead:beef
     }
 
     #[test]
-    fn auto_partition_prefers_one_sibling_per_physical_core_for_forwarding() {
+    fn auto_partition_keeps_forwarding_and_control_on_separate_smt_cores() {
         let groups = vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]];
         let (forwarding, control) = auto_partition_cpu_sets_from_core_groups(&groups);
-        assert_eq!(forwarding, vec![0, 2, 4, 6]);
-        assert_eq!(control, vec![1, 3, 5, 7]);
+        assert_eq!(forwarding, vec![0, 2, 4]);
+        assert_eq!(control, vec![6, 7]);
     }
 
     #[test]
@@ -2516,6 +2514,14 @@ dead:beef
         let (forwarding, control) = auto_partition_cpu_sets_from_core_groups(&groups);
         assert_eq!(forwarding, vec![0, 1, 2]);
         assert_eq!(control, vec![3]);
+    }
+
+    #[test]
+    fn auto_partition_single_smt_core_falls_back_to_split_siblings() {
+        let groups = vec![vec![0, 1]];
+        let (forwarding, control) = auto_partition_cpu_sets_from_core_groups(&groups);
+        assert_eq!(forwarding, vec![0]);
+        assert_eq!(control, vec![1]);
     }
 
     #[test]
