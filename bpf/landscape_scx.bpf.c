@@ -75,7 +75,7 @@ struct {
 	__uint(max_entries, LANDSCAPE_MAX_QIDS);
 	__type(key, __u32);
 	__type(value, struct landscape_queue_pressure_ctx);
-} queue_pressure_map SEC(".maps");
+} qpress_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -156,7 +156,7 @@ static __always_inline __u32 queue_pressure_level(__u32 qid)
 {
 	struct landscape_queue_pressure_ctx *pressure;
 
-	pressure = bpf_map_lookup_elem(&queue_pressure_map, &qid);
+	pressure = bpf_map_lookup_elem(&qpress_map, &qid);
 	if (!pressure)
 		return LANDSCAPE_PRESSURE_LEVEL_NONE;
 

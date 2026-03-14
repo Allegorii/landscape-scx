@@ -20,10 +20,11 @@ const LANDSCAPE_TASK_CLASS_CONTROL_PLANE: u32 = 2;
 const LANDSCAPE_TASK_CLASS_BACKGROUND: u32 = 3;
 const QID_OWNER_MAP_NAME: &str = "qid_owner_map";
 const TASK_CTX_MAP_NAME: &str = "task_ctx_map";
-const QUEUE_PRESSURE_MAP_NAME: &str = "queue_pressure_map";
+// BPF object names are limited to 15 visible bytes; keep the loaded map name short.
+const QUEUE_PRESSURE_MAP_NAME: &str = "qpress_map";
 const HOUSEKEEPING_CPU_MAP_NAME: &str = "hk_cpu_map";
 const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "hk_defcpu_map";
-const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 3;
+const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 4;
 const ACTIVE_CUSTOM_BPF_STATE_PATH: &str = "/run/landscape-scx/custom-bpf-active.toml";
 const CUSTOM_BPF_BPFFS_PREFIX: &str = "landscape-scx-";
 
