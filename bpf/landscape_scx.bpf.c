@@ -165,6 +165,11 @@ static __always_inline bool task_is_percpu_kthread(struct task_struct *p)
 	       BPF_CORE_READ(p, nr_cpus_allowed) == 1;
 }
 
+static __always_inline __u64 local_dsq_for_cpu(__u32 cpu)
+{
+	return SCX_DSQ_LOCAL_ON | cpu;
+}
+
 static __always_inline bool is_housekeeping_cpu(__u32 cpu)
 {
 	__u8 *value;
@@ -316,6 +321,9 @@ s32 BPF_STRUCT_OPS(landscape_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 	__u32 housekeeping_cpu = 0;
 	bool is_idle = false;
 
+	if (task_is_percpu_kthread(p))
+		return scx_bpf_task_cpu(p);
+
 	if (lookup_task_ctx(p, &task)) {
 		switch (task.class) {
 		case LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT:
@@ -389,6 +397,15 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 
 		scx_bpf_dsq_insert(p, LANDSCAPE_HOUSEKEEPING_DSQ,
 				 housekeeping_slice(task.class), enq_flags);
+		return 0;
+	}
+
+	if (task_is_percpu_kthread(p)) {
+		__u32 cpu = scx_bpf_task_cpu(p);
+
+		scx_bpf_dsq_insert(p, local_dsq_for_cpu(cpu), SCX_SLICE_DFL,
+				 enq_flags | SCX_ENQ_PREEMPT);
+		scx_bpf_kick_cpu((s32)cpu, SCX_KICK_PREEMPT);
 		return 0;
 	}
 
