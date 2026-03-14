@@ -21,7 +21,7 @@ use landscape_scx_common::{
     sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config,
     write_irq_affinity, write_rps_cpus, write_xps_cpus, xps_mask_matches, InterfaceLocalityPlan,
     LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskClass, LandscapeTaskIntent,
-    LandscapeTaskKind, SchedulerMode, ScxConfig, ThreadCandidate, ThreadCpuClass,
+    LandscapeTaskKind, SchedulerMode, ScxConfig, ScxSwitchMode, ThreadCandidate, ThreadCpuClass,
     LANDSCAPE_DSQ_BASE,
 };
 use tracing::{error, info, warn};
@@ -1953,7 +1953,7 @@ fn apply_builtin_switch_to_candidates(
     let intent_actions = intent
         .tasks
         .iter()
-        .map(|task| (task.key(), builtin_task_policy_action(task)))
+        .map(|task| (task.key(), builtin_task_policy_action(cfg, task)))
         .collect::<BTreeMap<_, _>>();
 
     info!("discovered {} candidate threads", list.len());
@@ -2197,11 +2197,11 @@ struct ThreadPolicyAction {
     apply_affinity: bool,
 }
 
-fn builtin_task_policy_action(task: &LandscapeTaskIntent) -> ThreadPolicyAction {
+fn builtin_task_policy_action(cfg: &ScxConfig, task: &LandscapeTaskIntent) -> ThreadPolicyAction {
     match task.kind {
         LandscapeTaskKind::Ksoftirqd => ThreadPolicyAction {
             cpus: vec![task.owner_cpu],
-            apply_sched_ext: true,
+            apply_sched_ext: matches!(cfg.scheduler.custom_bpf.switch_mode, ScxSwitchMode::Full),
             apply_affinity: false,
         },
         LandscapeTaskKind::ForwardingWorker => ThreadPolicyAction {
@@ -2524,7 +2524,10 @@ mod tests {
 
     #[test]
     fn builtin_forwarding_worker_action_forces_sched_ext_on_owner_cpu() {
-        let action = builtin_task_policy_action(&LandscapeTaskIntent {
+        let mut cfg = ScxConfig::default();
+        cfg.scheduler.mode = landscape_scx_common::SchedulerMode::CustomBpf;
+
+        let action = builtin_task_policy_action(&cfg, &LandscapeTaskIntent {
             pid: 15630,
             tid: 15630,
             start_time_ns: 123_456,
@@ -2538,6 +2541,28 @@ mod tests {
         assert_eq!(action.cpus, vec![11]);
         assert!(action.apply_sched_ext);
         assert!(action.apply_affinity);
+    }
+
+    #[test]
+    fn builtin_ksoftirqd_action_skips_sched_ext_in_partial_mode() {
+        let mut cfg = ScxConfig::default();
+        cfg.scheduler.mode = landscape_scx_common::SchedulerMode::CustomBpf;
+        cfg.scheduler.custom_bpf.switch_mode = ScxSwitchMode::Partial;
+
+        let action = builtin_task_policy_action(&cfg, &LandscapeTaskIntent {
+            pid: 14,
+            tid: 14,
+            start_time_ns: 123_456,
+            comm: "ksoftirqd/0".into(),
+            kind: LandscapeTaskKind::Ksoftirqd,
+            class: LandscapeTaskClass::DataplaneStrict,
+            qid: 0,
+            owner_cpu: 0,
+        });
+
+        assert_eq!(action.cpus, vec![0]);
+        assert!(!action.apply_sched_ext);
+        assert!(!action.apply_affinity);
     }
 
     fn test_pressure_plan(total_q0: u64, total_q1: u64) -> InterfaceLocalityPlan {
