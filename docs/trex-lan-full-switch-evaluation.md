@@ -74,9 +74,11 @@ After those fixes, the candidate profile remained:
 
 under sustained TRex LAN forwarding load, without watchdog fallback.
 
-## A/B Result
+## A/B Results
 
-Representative result from the final `64B` bidirectional run:
+Representative result from the final `64B` bidirectional runs:
+
+### Against `scx_cosmos`
 
 | Metric | `scx_cosmos` baseline | `custom_bpf` full-switch |
 | --- | ---: | ---: |
@@ -90,19 +92,36 @@ Representative result from the final `64B` bidirectional run:
 | `pressure_elevated_queues` | 0 | 0 |
 | `pressure_high_queues` | 0 | 0 |
 
+### Against pure CFS
+
+| Metric | `CFS` baseline | `custom_bpf` full-switch |
+| --- | ---: | ---: |
+| CPU util % | 14.58 | 14.56 |
+| RX Mbps total | 1184.88 | 1185.98 |
+| TX Mbps total | 1184.84 | 1185.93 |
+| `softnet_dropped_delta` | 0 | 0 |
+| `softnet_time_squeeze_delta` | 1 | 2 |
+| `ctxt_delta` | 149,111 | 154,852 |
+| `ksoftirqd_cpu_secs` | 0.04 | 0.00 |
+| `pressure_elevated_queues` | 0 | 0 |
+| `pressure_high_queues` | 0 | 0 |
+
 Interpretation:
 
-- throughput is effectively identical
+- throughput is effectively identical across all three schedulers
 - no queue-pressure or `softnet` saturation signal was triggered
-- steady-state scheduler overhead is at parity, with a slight edge to the
-  candidate in CPU utilization, context switches, and `ksoftirqd` time
+- compared with `scx_cosmos`, the candidate is at steady-state overhead parity
+  and slightly better on CPU utilization, context switches, and `ksoftirqd`
+- compared with pure CFS, the candidate is also effectively at parity:
+  throughput is negligibly higher, CPU is flat, `ksoftirqd` time is lower, but
+  context switches and `time_squeeze` are not better
 
 ## What This Proves
 
 - the built-in full-switch scheduler can now run stably on this host in a pure
   LAN L3 forwarding setup
-- the current steady-state overhead is no worse than `scx_cosmos` in a
-  practical 1G small-packet test
+- the current steady-state overhead is at the same order as both
+  `scx_cosmos` and pure CFS in a practical 1G small-packet test
 
 ## What This Does Not Prove
 
