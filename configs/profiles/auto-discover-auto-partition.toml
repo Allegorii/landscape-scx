@@ -1,0 +1,50 @@
+[discovery]
+process_names = ["landscape-webserver", "pppd"]
+cmdline_keywords = ["landscape-webserver"]
+cgroup_prefixes = ["/system.slice/landscape-router.service"]
+thread_include_prefixes = [
+  "ksoftirqd/",
+  "tokio-runtime-w",
+  "sqlx-sqlite-wor",
+  "r2d2-worker-",
+  "metric-db-threa",
+  "landscape-webse",
+  "pppd",
+]
+
+[policy]
+# Automatically derive forwarding/control CPU sets from the online topology.
+# On SMT systems, forwarding and control are kept on separate physical cores by default.
+auto_partition_cpus = true
+manage_ksoftirqd = true
+apply_sched_ext = false
+thread_cpu_classes = [
+  { thread_name_prefix = "ksoftirqd/", cpus = [], apply_sched_ext = false, apply_affinity = false },
+]
+
+[network]
+# Automatically discover manageable physical NICs and split forwarding CPUs evenly across them.
+auto_discover = true
+apply_irq_affinity = true
+apply_xps = false
+apply_rss_equal = true
+apply_combined_channels = true
+clear_inactive_xps = true
+queue_mapping_mode = "round_robin"
+xps_mode = "auto"
+rps_mode = "auto"
+active_queue_count = 0
+
+[scheduler]
+# Safe validation profile: keep CFS in charge until the auto-discovery result is verified.
+mode = "disabled"
+start_command = []
+stop_command = []
+pid_file = "/run/landscape-scx/auto-discover-auto-partition.pid"
+ready_timeout_ms = 0
+fallback_on_error = false
+
+[agent]
+apply_interval_secs = 5
+event_driven = true
+event_debounce_ms = 250
