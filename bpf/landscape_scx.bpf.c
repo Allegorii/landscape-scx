@@ -19,6 +19,8 @@
 #define LANDSCAPE_HOUSEKEEPING_DSQ 0x2000ULL
 #define LANDSCAPE_SOFTIRQ_DSQ_BASE 0x3000ULL
 #define LANDSCAPE_URGENT_DSQ_BASE 0x4000ULL
+#define LANDSCAPE_KTHREAD_DSQ_BASE 0x5000ULL
+#define LANDSCAPE_MAX_CPUS 256
 #define LANDSCAPE_TASK_F_DATAPLANE (1U << 0)
 #define LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT 0U
 #define LANDSCAPE_TASK_CLASS_DATAPLANE_SHARED 1U
@@ -142,6 +144,11 @@ static __always_inline __u64 softirq_dsq_for_qid(__u32 qid)
 static __always_inline __u64 urgent_dsq_for_qid(__u32 qid)
 {
 	return LANDSCAPE_URGENT_DSQ_BASE + qid;
+}
+
+static __always_inline __u64 kthread_dsq_for_cpu(__u32 cpu)
+{
+	return LANDSCAPE_KTHREAD_DSQ_BASE + cpu;
 }
 
 static __always_inline bool task_class_is_dataplane(__u32 task_class)
@@ -395,7 +402,7 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 	if (task_is_percpu_kthread(p)) {
 		__u32 cpu = scx_bpf_task_cpu(p);
 
-		scx_bpf_dsq_insert(p, local_dsq_for_cpu(cpu), SCX_SLICE_DFL,
+		scx_bpf_dsq_insert(p, kthread_dsq_for_cpu(cpu), SCX_SLICE_DFL,
 				 enq_flags | SCX_ENQ_PREEMPT);
 		scx_bpf_kick_cpu((s32)cpu, SCX_KICK_PREEMPT);
 		return 0;
@@ -493,6 +500,11 @@ s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
 	__u32 owner_cpu = cpu;
 	struct landscape_queue_owner_ctx *queue;
 
+	if (cpu >= 0 && cpu < LANDSCAPE_MAX_CPUS) {
+		if (scx_bpf_dsq_move_to_local(kthread_dsq_for_cpu((__u32)cpu)))
+			return 0;
+	}
+
 	queue = bpf_map_lookup_elem(&qid_owner_map, &owner_cpu);
 	if (queue) {
 		if (scx_bpf_dsq_move_to_local(urgent_dsq_for_qid(queue->qid)))
@@ -513,6 +525,7 @@ s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(landscape_init)
 {
+	__u32 cpu;
 	__u32 qid;
 
 #pragma clang loop unroll(disable)
@@ -521,6 +534,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(landscape_init)
 		scx_bpf_create_dsq(softirq_dsq_for_qid(qid), -1);
 		scx_bpf_create_dsq(urgent_dsq_for_qid(qid), -1);
 	}
+
+#pragma clang loop unroll(disable)
+	for (cpu = 0; cpu < LANDSCAPE_MAX_CPUS; cpu++)
+		scx_bpf_create_dsq(kthread_dsq_for_cpu(cpu), -1);
+
 	scx_bpf_create_dsq(LANDSCAPE_HOUSEKEEPING_DSQ, -1);
 
 	return 0;
