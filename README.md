@@ -169,6 +169,64 @@ will fail if a managed interface or its queue/IRQ files are missing.
 For manual fallback outside the agent, use `./scripts/apply_network_locality.sh`.
 That helper currently mirrors IRQ/XPS placement only; `ethtool -X/-L` and inactive XPS cleanup are handled by the agent.
 
+### Automatic discovery and CPU partitioning
+
+For router hosts where you want the agent to manage all discoverable dataplane
+NICs without maintaining per-interface CPU lists, enable automatic discovery
+and automatic CPU partitioning:
+
+```toml
+[policy]
+auto_partition_cpus = true
+manage_ksoftirqd = true
+apply_sched_ext = false
+
+[network]
+auto_discover = true
+apply_irq_affinity = true
+apply_xps = false
+apply_rss_equal = true
+apply_combined_channels = true
+clear_inactive_xps = true
+queue_mapping_mode = "round_robin"
+xps_mode = "auto"
+rps_mode = "auto"
+active_queue_count = 0
+
+[scheduler]
+mode = "custom_bpf"
+
+[scheduler.custom_bpf]
+switch_mode = "full"
+forwarding_thread_prefixes = ["pppd", "landscape_pppoe", "pppoe-rx-", "landscape-forwarder"]
+```
+
+Current automatic behavior:
+
+- bridge-aware discovery groups slave ports by `master`
+- `NO-CARRIER` ports and interfaces without usable queue / IRQ locality data are skipped
+- forwarding and control CPUs are derived from online topology
+- on SMT hosts, forwarding and control are kept on separate physical cores by default
+- `scheduler.custom_bpf.housekeeping_cpus` may be left empty; it falls back to the effective control CPU set
+- `active_queue_count = 0` still auto-sizes each managed interface to the smaller of:
+  - usable queue / IRQ capacity
+  - forwarding physical-core capacity
+
+Optional automatic-discovery filters:
+
+```toml
+[network]
+auto_discover = true
+auto_discover_include_prefixes = ["ens28"]
+# auto_discover_exclude_prefixes = ["ens16", "ens27"]
+```
+
+- `auto_discover_include_prefixes` restricts discovery to matching names
+- `auto_discover_exclude_prefixes` removes matching names and takes precedence over `include`
+
+The repository ships a ready-to-run example at
+[`configs/profiles/auto-discover-auto-partition.toml`](./configs/profiles/auto-discover-auto-partition.toml).
+
 ## Scheduler lifecycle
 
 `sudo cargo run -p landscape-scx-agent -- load-scheduler --config ./configs/landscape-scx.toml`

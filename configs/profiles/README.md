@@ -53,6 +53,11 @@ These templates are designed for common hardware layouts.
   - full-switch built-in `custom_bpf` variant for dedicated router-host testing
   - keeps the same 8-queue WAN locality but routes non-dataplane tasks through housekeeping CPUs/DSQ instead of leaving the machine in partial mode
 
+- `auto-discover-auto-partition.toml`
+  - automatic built-in `custom_bpf` full-switch profile
+  - discovers all manageable physical NICs automatically, groups bridge slaves by `master`, and auto-partitions forwarding vs control CPUs from topology
+  - supports `auto_discover_include_prefixes` / `auto_discover_exclude_prefixes` when "all manageable NICs" is too broad for the host
+
 - `custom-bpf-local-test.toml`
   - minimal local validation profile for the built-in `custom_bpf` loader
   - does not manage NIC locality or switch any workload threads; it is only for verifying compile/register flow
@@ -73,6 +78,10 @@ These templates are designed for common hardware layouts.
 - For dedicated router hosts that should move beyond partial mode, start from `archld-32c-dualwan-8q-custom-bpf-full.toml`
   - this is the aggressive path for evaluating a full `sched_ext` takeover with explicit housekeeping CPUs
   - validate it only after the partial `archld-32c-dualwan-8q-custom-bpf.toml` path is already stable on the target host
+
+- If you want one profile that discovers interfaces and derives CPU islands automatically, start from `auto-discover-auto-partition.toml`
+  - this is the least manual path for hosts that should let the agent manage all discoverable dataplane NICs
+  - add `auto_discover_include_prefixes` or `auto_discover_exclude_prefixes` when only a subset of interfaces should be managed
 
 - Use `balanced-4c.toml`, `balanced-8c.toml`, `low-latency-8c.toml`, and `throughput-16c.toml` as generic baselines or benchmark comparisons
   - these are still useful, but they are broader scheduling templates rather than Landscape-specific defaults
