@@ -28,6 +28,7 @@
 #define LANDSCAPE_HOUSEKEEPING_SLICE (SCX_SLICE_DFL / 4)
 #define LANDSCAPE_BACKGROUND_SLICE (SCX_SLICE_DFL / 8)
 #define PF_KTHREAD 0x00200000
+#define SCX_KICK_PREEMPT (1LLU << 1)
 
 #define BPF_STRUCT_OPS(name, args...) SEC("struct_ops/" #name) BPF_PROG(name, ##args)
 #define BPF_STRUCT_OPS_SLEEPABLE(name, args...) SEC("struct_ops.s/" #name) BPF_PROG(name, ##args)
@@ -248,13 +249,17 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 	if (lookup_task_ctx(p, &task)) {
 		if (task_is_dataplane(&task)) {
 			/*
-			 * Per-CPU kthreads such as ksoftirqd must be able to
-			 * preempt queue-bound workers on their owner CPU, or
-			 * sched_ext's watchdog will trip on runnable-task stall.
+			 * Per-CPU kthreads such as ksoftirqd don't reliably go
+			 * through select_cpu() and thus can't be directly sent
+			 * to another CPU's local DSQ from enqueue(). Keep them
+			 * on their owner queue, but force head-of-line service
+			 * and kick the owner CPU into the scheduling path so
+			 * queue-bound workers can't starve softirq progress.
 			 */
 			if (task_is_percpu_kthread(p)) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
-						 enq_flags | SCX_ENQ_PREEMPT);
+				scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), SCX_SLICE_DFL,
+						 enq_flags | SCX_ENQ_HEAD);
+				scx_bpf_kick_cpu((s32)task.owner_cpu, SCX_KICK_PREEMPT);
 				return 0;
 			}
 
