@@ -44,6 +44,8 @@ pub struct PolicyConfig {
     pub forwarding_cpus: Vec<usize>,
     #[serde(default = "default_control_cpus")]
     pub control_cpus: Vec<usize>,
+    #[serde(default)]
+    pub auto_partition_cpus: bool,
     #[serde(default = "default_enable_ksoftirqd")]
     pub manage_ksoftirqd: bool,
     #[serde(default)]
@@ -309,6 +311,7 @@ impl Default for PolicyConfig {
         Self {
             forwarding_cpus: default_forwarding_cpus(),
             control_cpus: default_control_cpus(),
+            auto_partition_cpus: false,
             manage_ksoftirqd: default_enable_ksoftirqd(),
             ksoftirqd_cpus: Vec::new(),
             apply_sched_ext: default_enable_sched_ext(),
@@ -386,6 +389,12 @@ fn default_forwarding_cpus() -> Vec<usize> {
 
 fn default_control_cpus() -> Vec<usize> {
     vec![2, 3]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPolicyCpuSets {
+    forwarding_cpus: Vec<usize>,
+    control_cpus: Vec<usize>,
 }
 
 const fn default_enable_ksoftirqd() -> bool {
@@ -572,7 +581,10 @@ fn matches_ksoftirqd(comm: &str, cpu: usize, cfg: &ScxConfig) -> bool {
         return false;
     }
 
-    if !effective_ksoftirqd_cpus(&cfg.policy).contains(&cpu) {
+    let Ok(ksoftirqd_cpus) = effective_ksoftirqd_cpus(cfg) else {
+        return false;
+    };
+    if !ksoftirqd_cpus.contains(&cpu) {
         return false;
     }
 
@@ -592,11 +604,110 @@ fn prefix_matches_any(comm: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|prefix| !prefix.is_empty() && comm.starts_with(prefix))
 }
 
-fn effective_ksoftirqd_cpus(policy: &PolicyConfig) -> Vec<usize> {
-    if !policy.ksoftirqd_cpus.is_empty() {
-        return policy.ksoftirqd_cpus.clone();
+pub fn effective_forwarding_cpus(cfg: &ScxConfig) -> Result<Vec<usize>> {
+    Ok(resolve_policy_cpu_sets(cfg)?.forwarding_cpus)
+}
+
+pub fn effective_control_cpus(cfg: &ScxConfig) -> Result<Vec<usize>> {
+    Ok(resolve_policy_cpu_sets(cfg)?.control_cpus)
+}
+
+pub fn effective_ksoftirqd_cpus(cfg: &ScxConfig) -> Result<Vec<usize>> {
+    if !cfg.policy.ksoftirqd_cpus.is_empty() {
+        return Ok(cfg.policy.ksoftirqd_cpus.clone());
     }
-    policy.forwarding_cpus.clone()
+    effective_forwarding_cpus(cfg)
+}
+
+fn resolve_policy_cpu_sets(cfg: &ScxConfig) -> Result<ResolvedPolicyCpuSets> {
+    if !cfg.policy.auto_partition_cpus {
+        return Ok(ResolvedPolicyCpuSets {
+            forwarding_cpus: cfg.policy.forwarding_cpus.clone(),
+            control_cpus: cfg.policy.control_cpus.clone(),
+        });
+    }
+
+    let online = read_online_cpus()?;
+    let groups = online_cpu_core_groups(&online)?;
+    let (forwarding_cpus, control_cpus) = auto_partition_cpu_sets_from_core_groups(&groups);
+
+    Ok(ResolvedPolicyCpuSets { forwarding_cpus, control_cpus })
+}
+
+fn online_cpu_core_groups(online: &BTreeSet<usize>) -> Result<Vec<Vec<usize>>> {
+    let mut seen = BTreeSet::new();
+    let mut groups = Vec::new();
+
+    for cpu in online.iter().copied() {
+        if seen.contains(&cpu) {
+            continue;
+        }
+
+        let mut group = read_cpu_thread_siblings(cpu)
+            .unwrap_or_else(|_| BTreeSet::from([cpu]))
+            .into_iter()
+            .filter(|sibling| online.contains(sibling))
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            group.push(cpu);
+        }
+        group.sort_unstable();
+
+        for sibling in &group {
+            seen.insert(*sibling);
+        }
+        groups.push(group);
+    }
+
+    groups.sort_by_key(|group| group[0]);
+    Ok(groups)
+}
+
+fn auto_partition_cpu_sets_from_core_groups(core_groups: &[Vec<usize>]) -> (Vec<usize>, Vec<usize>) {
+    if core_groups.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let has_smt = core_groups.iter().any(|group| group.len() > 1);
+    if has_smt {
+        let forwarding_cpus: Vec<usize> =
+            core_groups.iter().filter_map(|group| group.first().copied()).collect();
+        let mut control_cpus = core_groups
+            .iter()
+            .flat_map(|group| group.iter().skip(1).copied())
+            .collect::<Vec<_>>();
+        if control_cpus.is_empty() {
+            control_cpus = forwarding_cpus.clone();
+        }
+        return (forwarding_cpus, control_cpus);
+    }
+
+    let reserve_groups = if core_groups.len() <= 1 { 0 } else { (core_groups.len() / 4).max(1) };
+    let split_at = core_groups.len().saturating_sub(reserve_groups);
+
+    let mut forwarding_cpus = core_groups
+        .iter()
+        .take(split_at)
+        .filter_map(|group| group.first().copied())
+        .collect::<Vec<_>>();
+    let mut control_cpus = core_groups
+        .iter()
+        .skip(split_at)
+        .flat_map(|group| group.iter().copied())
+        .collect::<Vec<_>>();
+
+    if forwarding_cpus.is_empty() {
+        forwarding_cpus = core_groups
+            .iter()
+            .take(1)
+            .filter_map(|group| group.first().copied())
+            .collect::<Vec<_>>();
+    }
+    if control_cpus.is_empty() {
+        control_cpus = forwarding_cpus.clone();
+    }
+
+    (forwarding_cpus, control_cpus)
 }
 
 pub fn parse_ksoftirqd_cpu(comm: &str) -> Option<usize> {
@@ -889,14 +1000,14 @@ pub struct RssEqualAction {
 }
 
 impl NetworkInterfaceSpec {
-    fn resolve(&self, cfg: &ScxConfig) -> ResolvedNetworkInterface {
+    fn resolve(&self, cfg: &ScxConfig) -> Result<ResolvedNetworkInterface> {
         let network = &cfg.network;
-        let policy = &cfg.policy;
+        let forwarding_cpus = effective_forwarding_cpus(cfg)?;
         match self {
             NetworkInterfaceSpec::Name(name) => {
                 let mut resolved = ResolvedNetworkInterface {
                     name: name.clone(),
-                    forwarding_cpus: policy.forwarding_cpus.clone(),
+                    forwarding_cpus,
                     active_queue_count: network.active_queue_count,
                     apply_rss_equal: network.apply_rss_equal,
                     apply_combined_channels: network.apply_combined_channels,
@@ -907,13 +1018,13 @@ impl NetworkInterfaceSpec {
                     rps_mode: network.rps_mode.clone(),
                 };
                 resolved.xps_mode = effective_xps_mode(cfg, &resolved);
-                resolved
+                Ok(resolved)
             }
             NetworkInterfaceSpec::Config(iface_cfg) => {
                 let mut resolved = ResolvedNetworkInterface {
                     name: iface_cfg.name.clone(),
                     forwarding_cpus: if iface_cfg.forwarding_cpus.is_empty() {
-                        policy.forwarding_cpus.clone()
+                        forwarding_cpus
                     } else {
                         iface_cfg.forwarding_cpus.clone()
                     },
@@ -947,7 +1058,7 @@ impl NetworkInterfaceSpec {
                         .unwrap_or_else(|| network.rps_mode.clone()),
                 };
                 resolved.xps_mode = effective_xps_mode(cfg, &resolved);
-                resolved
+                Ok(resolved)
             }
         }
     }
@@ -962,7 +1073,7 @@ fn resolved_network_interfaces_at(
     sys_class_net: &Path,
 ) -> Result<Vec<ResolvedNetworkInterface>> {
     if !cfg.network.interfaces.is_empty() {
-        return Ok(cfg.network.interfaces.iter().map(|iface| iface.resolve(cfg)).collect());
+        return cfg.network.interfaces.iter().map(|iface| iface.resolve(cfg)).collect();
     }
 
     if !cfg.network.auto_discover {
@@ -982,7 +1093,7 @@ fn auto_discovered_network_interfaces(
     }
 
     let forwarding_cpu_sets =
-        split_forwarding_cpus_across_interfaces(&cfg.policy.forwarding_cpus, names.len())?;
+        split_forwarding_cpus_across_interfaces(&effective_forwarding_cpus(cfg)?, names.len())?;
     let network = &cfg.network;
     let mut out = Vec::with_capacity(names.len());
 
@@ -1956,9 +2067,11 @@ fn write_trimmed(path: &Path, value: &str) -> Result<()> {
 
 pub fn validate_cpu_config(cfg: &ScxConfig) -> Result<()> {
     let online = read_online_cpus()?;
+    let forwarding_cpus = effective_forwarding_cpus(cfg)?;
+    let control_cpus = effective_control_cpus(cfg)?;
 
-    validate_cpu_set("policy.forwarding_cpus", &cfg.policy.forwarding_cpus, &online)?;
-    validate_cpu_set("policy.control_cpus", &cfg.policy.control_cpus, &online)?;
+    validate_cpu_set("policy.forwarding_cpus", &forwarding_cpus, &online)?;
+    validate_cpu_set("policy.control_cpus", &control_cpus, &online)?;
     if !cfg.policy.ksoftirqd_cpus.is_empty() {
         validate_optional_cpu_set("policy.ksoftirqd_cpus", &cfg.policy.ksoftirqd_cpus, &online)?;
     }
@@ -2081,9 +2194,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        affinity_list_matches, build_interface_rps_actions, cpu_list_string, cpu_mask_string,
-        effective_active_queue_count, interface_is_auto_discoverable, matches_target,
-        parse_cpu_mask,
+        affinity_list_matches, auto_partition_cpu_sets_from_core_groups, build_interface_rps_actions,
+        cpu_list_string, cpu_mask_string, effective_active_queue_count,
+        interface_is_auto_discoverable, matches_target, parse_cpu_mask,
         parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
         parse_ksoftirqd_cpu, resolved_network_interfaces, resolved_network_interfaces_at,
         rss_equal_matches, split_forwarding_cpus_across_interfaces, xps_mask_matches,
@@ -2105,6 +2218,7 @@ mod tests {
             policy: PolicyConfig {
                 forwarding_cpus: vec![0, 1],
                 control_cpus: vec![2, 3],
+                auto_partition_cpus: false,
                 manage_ksoftirqd: true,
                 ksoftirqd_cpus: Vec::new(),
                 apply_sched_ext: true,
@@ -2386,6 +2500,22 @@ dead:beef
     fn auto_discover_requires_enough_forwarding_cpus() {
         let err = split_forwarding_cpus_across_interfaces(&[0, 1], 3).unwrap_err().to_string();
         assert!(err.contains("network.auto_discover found 3 interfaces"));
+    }
+
+    #[test]
+    fn auto_partition_prefers_one_sibling_per_physical_core_for_forwarding() {
+        let groups = vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]];
+        let (forwarding, control) = auto_partition_cpu_sets_from_core_groups(&groups);
+        assert_eq!(forwarding, vec![0, 2, 4, 6]);
+        assert_eq!(control, vec![1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn auto_partition_reserves_a_fraction_of_non_smt_cores_for_control() {
+        let groups = vec![vec![0], vec![1], vec![2], vec![3]];
+        let (forwarding, control) = auto_partition_cpu_sets_from_core_groups(&groups);
+        assert_eq!(forwarding, vec![0, 1, 2]);
+        assert_eq!(control, vec![3]);
     }
 
     #[test]

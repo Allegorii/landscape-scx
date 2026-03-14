@@ -16,13 +16,14 @@ use landscape_scx_bpf::{
 };
 use landscape_scx_common::{
     affinity_list_matches, apply_ethtool_combined_channels, apply_ethtool_rss_equal,
-    build_network_locality_plans, desired_locality_cpus, discover_candidates, get_sched_policy,
-    irqbalance_conflicts, load_config, parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches,
-    sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, try_set_sched_other,
-    validate_cpu_config, write_irq_affinity, write_rps_cpus, write_xps_cpus, xps_mask_matches,
-    InterfaceLocalityPlan, LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskClass,
-    LandscapeTaskIntent, LandscapeTaskKind, SchedulerMode, ScxConfig, ScxSwitchMode,
-    ThreadCandidate, ThreadCpuClass, SCHED_EXT_POLICY, LANDSCAPE_DSQ_BASE,
+    build_network_locality_plans, desired_locality_cpus, discover_candidates,
+    effective_control_cpus, effective_forwarding_cpus, get_sched_policy, irqbalance_conflicts,
+    load_config, parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches, sched_policy_name,
+    try_set_cpu_affinity, try_set_sched_ext, try_set_sched_other, validate_cpu_config,
+    write_irq_affinity, write_rps_cpus, write_xps_cpus, xps_mask_matches, InterfaceLocalityPlan,
+    LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskClass, LandscapeTaskIntent,
+    LandscapeTaskKind, SchedulerMode, ScxConfig, ScxSwitchMode, ThreadCandidate, ThreadCpuClass,
+    SCHED_EXT_POLICY, LANDSCAPE_DSQ_BASE,
 };
 use tracing::{error, info, warn};
 
@@ -2144,10 +2145,9 @@ fn effective_housekeeping_cpus(cfg: &ScxConfig) -> Vec<usize> {
     if !cfg.scheduler.custom_bpf.housekeeping_cpus.is_empty() {
         return cfg.scheduler.custom_bpf.housekeeping_cpus.clone();
     }
-    if !cfg.policy.control_cpus.is_empty() {
-        return cfg.policy.control_cpus.clone();
-    }
-    cfg.policy.forwarding_cpus.clone()
+    effective_control_cpus(cfg)
+        .or_else(|_| effective_forwarding_cpus(cfg))
+        .unwrap_or_else(|_| cfg.policy.forwarding_cpus.clone())
 }
 
 fn matches_forwarding_worker(cfg: &ScxConfig, comm: &str) -> bool {
@@ -2346,11 +2346,9 @@ fn default_cpu_set(cfg: &ScxConfig, comm: &str) -> Vec<usize> {
         return vec![cpu];
     }
 
-    if cfg.policy.control_cpus.is_empty() {
-        return cfg.policy.forwarding_cpus.clone();
-    }
-
-    cfg.policy.control_cpus.clone()
+    effective_control_cpus(cfg)
+        .or_else(|_| effective_forwarding_cpus(cfg))
+        .unwrap_or_else(|_| cfg.policy.forwarding_cpus.clone())
 }
 
 fn matching_thread_class<'a>(cfg: &'a ScxConfig, comm: &str) -> Option<&'a ThreadCpuClass> {
