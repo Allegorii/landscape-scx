@@ -25,6 +25,9 @@ thread_cpu_classes = [
 [network]
 # Automatically discover manageable physical NICs and split forwarding CPUs evenly across them.
 auto_discover = true
+# Optional filters:
+# auto_discover_include_prefixes = ["ens28"]
+# auto_discover_exclude_prefixes = ["ens16", "ens27"]
 apply_irq_affinity = true
 apply_xps = false
 apply_rss_equal = true

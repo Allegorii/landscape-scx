@@ -74,6 +74,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub auto_discover: bool,
     #[serde(default)]
+    pub auto_discover_include_prefixes: Vec<String>,
+    #[serde(default)]
+    pub auto_discover_exclude_prefixes: Vec<String>,
+    #[serde(default)]
     pub apply_irq_affinity: bool,
     #[serde(default)]
     pub apply_xps: bool,
@@ -362,6 +366,8 @@ impl Default for NetworkConfig {
         Self {
             interfaces: Vec::new(),
             auto_discover: false,
+            auto_discover_include_prefixes: Vec::new(),
+            auto_discover_exclude_prefixes: Vec::new(),
             apply_irq_affinity: false,
             apply_xps: false,
             apply_rss_equal: false,
@@ -1094,7 +1100,7 @@ fn auto_discovered_network_interfaces(
     cfg: &ScxConfig,
     sys_class_net: &Path,
 ) -> Result<Vec<ResolvedNetworkInterface>> {
-    let groups = discover_auto_network_interface_groups(sys_class_net)?;
+    let groups = discover_auto_network_interface_groups(cfg, sys_class_net)?;
     if groups.is_empty() {
         return Ok(Vec::new());
     }
@@ -1204,7 +1210,10 @@ fn auto_discovered_interface_supports_queue_mode(
     }
 }
 
-fn discover_auto_network_interface_groups(sys_class_net: &Path) -> Result<Vec<AutoDiscoveredInterfaceGroup>> {
+fn discover_auto_network_interface_groups(
+    cfg: &ScxConfig,
+    sys_class_net: &Path,
+) -> Result<Vec<AutoDiscoveredInterfaceGroup>> {
     let mut groups = BTreeMap::<String, Vec<String>>::new();
 
     for entry in fs::read_dir(sys_class_net)
@@ -1215,6 +1224,9 @@ fn discover_auto_network_interface_groups(sys_class_net: &Path) -> Result<Vec<Au
             Err(_) => continue,
         };
         let name = entry.file_name().to_string_lossy().to_string();
+        if !auto_discover_name_matches_filters(&cfg.network, &name) {
+            continue;
+        }
         if interface_is_auto_discoverable(&name, &entry.path())? {
             let key = auto_discover_group_key(&name, &entry.path())?;
             groups.entry(key).or_default().push(name);
@@ -1230,6 +1242,25 @@ fn discover_auto_network_interface_groups(sys_class_net: &Path) -> Result<Vec<Au
         .collect::<Vec<_>>();
     out.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(out)
+}
+
+fn auto_discover_name_matches_filters(network: &NetworkConfig, name: &str) -> bool {
+    if network
+        .auto_discover_exclude_prefixes
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return false;
+    }
+
+    if network.auto_discover_include_prefixes.is_empty() {
+        return true;
+    }
+
+    network
+        .auto_discover_include_prefixes
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn auto_discover_group_key(name: &str, iface_root: &Path) -> Result<String> {
@@ -2469,6 +2500,8 @@ mod tests {
             network: NetworkConfig {
                 interfaces: Vec::new(),
                 auto_discover: false,
+                auto_discover_include_prefixes: Vec::new(),
+                auto_discover_exclude_prefixes: Vec::new(),
                 apply_irq_affinity: false,
                 apply_xps: false,
                 apply_rss_equal: false,
@@ -2830,12 +2863,45 @@ dead:beef
         symlink(&br_lan, ens27f1.join("master")).unwrap();
         symlink(&br_lan, ens17.join("master")).unwrap();
 
-        let groups = discover_auto_network_interface_groups(&root).unwrap();
+        let cfg = test_config();
+        let groups = discover_auto_network_interface_groups(&cfg, &root).unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].key, "br_lan");
         assert_eq!(groups[0].members, vec!["ens18".to_string(), "ens27f1".to_string()]);
         assert_eq!(groups[1].key, "ens28f0");
         assert_eq!(groups[1].members, vec!["ens28f0".to_string()]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_discover_honors_include_and_exclude_prefix_filters() {
+        let root = unique_test_dir("auto-discover-prefix-filters");
+        let ens16f1np1 = root.join("ens16f1np1");
+        let ens27f0 = root.join("ens27f0");
+        let ens28f0 = root.join("ens28f0");
+        let ens28f1 = root.join("ens28f1");
+
+        for iface in [&ens16f1np1, &ens27f0, &ens28f0, &ens28f1] {
+            fs::create_dir_all(iface.join("device")).unwrap();
+            fs::create_dir_all(iface.join("queues/tx-0")).unwrap();
+            fs::write(iface.join("queues/tx-0/xps_cpus"), "0\n").unwrap();
+            fs::create_dir_all(iface.join("queues/rx-0")).unwrap();
+            fs::write(iface.join("carrier"), "1\n").unwrap();
+        }
+
+        let mut cfg = test_config();
+        cfg.network.auto_discover = true;
+        cfg.network.apply_xps = true;
+        cfg.network.xps_mode = XpsMode::Cpus;
+        cfg.network.auto_discover_include_prefixes = vec!["ens28".into(), "ens16".into()];
+        cfg.network.auto_discover_exclude_prefixes = vec!["ens16".into()];
+        cfg.policy.forwarding_cpus = vec![0, 1, 2, 3];
+
+        let resolved = resolved_network_interfaces_at(&cfg, &root).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "ens28f0");
+        assert_eq!(resolved[1].name, "ens28f1");
 
         fs::remove_dir_all(root).unwrap();
     }
