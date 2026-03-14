@@ -1161,7 +1161,7 @@ fn auto_discovered_compatible_group_members(
             };
             resolved.xps_mode = effective_xps_mode(cfg, &resolved);
 
-            if auto_discovered_interface_supports_queue_mode(sys_class_net, &resolved) {
+            if auto_discovered_interface_supports_queue_mode(cfg, sys_class_net, &resolved) {
                 Some(name.clone())
             } else {
                 None
@@ -1171,6 +1171,7 @@ fn auto_discovered_compatible_group_members(
 }
 
 fn auto_discovered_interface_supports_queue_mode(
+    cfg: &ScxConfig,
     sys_class_net: &Path,
     iface: &ResolvedNetworkInterface,
 ) -> bool {
@@ -1185,6 +1186,15 @@ fn auto_discovered_interface_supports_queue_mode(
 
     if !matches!(iface.rps_mode, RpsMode::Preserve) && queue_entry_count_at(&iface_root, "rx-") == 0 {
         return false;
+    }
+    if cfg.network.apply_irq_affinity {
+        let interrupts = match fs::read_to_string("/proc/interrupts") {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if irq_label_count_in_interrupts(&interrupts, &iface.name) == 0 {
+            return false;
+        }
     }
 
     match iface.xps_mode {
@@ -1948,6 +1958,20 @@ fn parse_interrupt_total_count(rest: &str, cpu_columns: usize) -> u64 {
     rest.split_whitespace().take(cpu_columns).filter_map(|field| field.parse::<u64>().ok()).sum()
 }
 
+fn irq_label_count_in_interrupts(raw: &str, iface: &str) -> usize {
+    raw.lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(':')?;
+            let label = rest.split_whitespace().last().unwrap_or_default();
+            if label.contains(iface) && parse_irq_queue_index(label).is_some() {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .count()
+}
+
 fn build_interface_xps_actions(
     iface: &ResolvedNetworkInterface,
     status: &InterfaceLocalityStatus,
@@ -2415,7 +2439,7 @@ mod tests {
         affinity_list_matches, auto_partition_cpu_sets_from_core_groups, build_interface_rps_actions,
         cpu_list_string, cpu_mask_string, discover_auto_network_interface_groups,
         effective_active_queue_count, interface_is_auto_discoverable, matches_target, parse_cpu_mask,
-        parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
+        irq_label_count_in_interrupts, parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
         parse_ksoftirqd_cpu, resolved_network_interfaces, resolved_network_interfaces_at,
         rss_equal_matches, split_forwarding_cpus_across_interfaces, xps_mask_matches,
         ChannelStatus, CustomBpfSchedulerConfig, DiscoveryConfig, InterfaceLocalityStatus,
@@ -2545,6 +2569,21 @@ mod tests {
         assert_eq!(parse_irq_queue_index("mlx5e-rx-9"), Some(9));
         assert_eq!(parse_irq_queue_index("ens27f0"), None);
         assert_eq!(parse_irq_queue_index("i40e-ens16f1np1"), None);
+    }
+
+    #[test]
+    fn irq_label_count_in_interrupts_filters_queue_style_labels() {
+        let raw = r#"
+           CPU0       CPU1
+ 97:          1          2  PCI-MSI  ens16f0np0-TxRx-0
+ 98:          3          4  PCI-MSI  ens16f0np0-TxRx-1
+ 99:          5          6  PCI-MSI  ens18
+100:          7          8  PCI-MSI  i40e-ens16f1np1-TxRx-0
+"#;
+
+        assert_eq!(irq_label_count_in_interrupts(raw, "ens16f0np0"), 2);
+        assert_eq!(irq_label_count_in_interrupts(raw, "ens18"), 0);
+        assert_eq!(irq_label_count_in_interrupts(raw, "ens16f1np1"), 1);
     }
 
     #[test]
