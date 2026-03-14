@@ -318,7 +318,6 @@ static __always_inline __u64 dataplane_run_budget_ns(
 s32 BPF_STRUCT_OPS(landscape_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct landscape_task_ctx task = {};
-	__u32 housekeeping_cpu = 0;
 	bool is_idle = false;
 
 	if (task_is_percpu_kthread(p))
@@ -341,12 +340,6 @@ s32 BPF_STRUCT_OPS(landscape_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 			break;
 		}
 	}
-
-	if (prev_cpu >= 0 && is_housekeeping_cpu((__u32)prev_cpu))
-		return prev_cpu;
-
-	if (default_housekeeping_cpu(&housekeeping_cpu))
-		return housekeeping_cpu;
 
 	return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 }
@@ -395,8 +388,7 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 			return 0;
 		}
 
-		scx_bpf_dsq_insert(p, LANDSCAPE_HOUSEKEEPING_DSQ,
-				 housekeeping_slice(task.class), enq_flags);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, housekeeping_slice(task.class), enq_flags);
 		return 0;
 	}
 
@@ -409,8 +401,7 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 		return 0;
 	}
 
-	scx_bpf_dsq_insert(p, LANDSCAPE_HOUSEKEEPING_DSQ, LANDSCAPE_HOUSEKEEPING_SLICE,
-			 enq_flags);
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, LANDSCAPE_HOUSEKEEPING_SLICE, enq_flags);
 	return 0;
 }
 
@@ -515,18 +506,6 @@ s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	if (queue && queue_pressure_level(queue->qid) >= LANDSCAPE_PRESSURE_LEVEL_ELEVATED)
-		return 0;
-
-	if (!is_housekeeping_cpu(owner_cpu))
-		return 0;
-
-	/*
-	 * During full-switch bootstrap the runtime ownership maps are populated
-	 * by user space immediately after registration. Until then, fall back to
-	 * the housekeeping DSQ so the scheduler can stay alive long enough for the
-	 * first map sync to land.
-	 */
-	if (scx_bpf_dsq_move_to_local(LANDSCAPE_HOUSEKEEPING_DSQ))
 		return 0;
 
 	return 0;
