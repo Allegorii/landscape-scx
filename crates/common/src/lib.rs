@@ -70,6 +70,8 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub interfaces: Vec<NetworkInterfaceSpec>,
     #[serde(default)]
+    pub auto_discover: bool,
+    #[serde(default)]
     pub apply_irq_affinity: bool,
     #[serde(default)]
     pub apply_xps: bool,
@@ -356,6 +358,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             interfaces: Vec::new(),
+            auto_discover: false,
             apply_irq_affinity: false,
             apply_xps: false,
             apply_rss_equal: false,
@@ -950,8 +953,142 @@ impl NetworkInterfaceSpec {
     }
 }
 
-fn resolved_network_interfaces(cfg: &ScxConfig) -> Vec<ResolvedNetworkInterface> {
-    cfg.network.interfaces.iter().map(|iface| iface.resolve(cfg)).collect()
+fn resolved_network_interfaces(cfg: &ScxConfig) -> Result<Vec<ResolvedNetworkInterface>> {
+    resolved_network_interfaces_at(cfg, Path::new("/sys/class/net"))
+}
+
+fn resolved_network_interfaces_at(
+    cfg: &ScxConfig,
+    sys_class_net: &Path,
+) -> Result<Vec<ResolvedNetworkInterface>> {
+    if !cfg.network.interfaces.is_empty() {
+        return Ok(cfg.network.interfaces.iter().map(|iface| iface.resolve(cfg)).collect());
+    }
+
+    if !cfg.network.auto_discover {
+        return Ok(Vec::new());
+    }
+
+    auto_discovered_network_interfaces(cfg, sys_class_net)
+}
+
+fn auto_discovered_network_interfaces(
+    cfg: &ScxConfig,
+    sys_class_net: &Path,
+) -> Result<Vec<ResolvedNetworkInterface>> {
+    let names = discover_auto_network_interface_names(sys_class_net)?;
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let forwarding_cpu_sets =
+        split_forwarding_cpus_across_interfaces(&cfg.policy.forwarding_cpus, names.len())?;
+    let network = &cfg.network;
+    let mut out = Vec::with_capacity(names.len());
+
+    for (name, forwarding_cpus) in names.into_iter().zip(forwarding_cpu_sets.into_iter()) {
+        let mut resolved = ResolvedNetworkInterface {
+            name,
+            forwarding_cpus,
+            active_queue_count: network.active_queue_count,
+            apply_rss_equal: network.apply_rss_equal,
+            apply_combined_channels: network.apply_combined_channels,
+            clear_inactive_xps: network.clear_inactive_xps,
+            queue_mapping_mode: network.queue_mapping_mode.clone(),
+            requested_xps_mode: network.xps_mode.clone(),
+            xps_mode: network.xps_mode.clone(),
+            rps_mode: network.rps_mode.clone(),
+        };
+        resolved.xps_mode = effective_xps_mode(cfg, &resolved);
+        out.push(resolved);
+    }
+
+    Ok(out)
+}
+
+fn discover_auto_network_interface_names(sys_class_net: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+
+    for entry in fs::read_dir(sys_class_net)
+        .with_context(|| format!("failed to read {}", sys_class_net.display()))?
+    {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if interface_is_auto_discoverable(&name, &entry.path())? {
+            out.push(name);
+        }
+    }
+
+    out.sort();
+    Ok(out)
+}
+
+fn interface_is_auto_discoverable(name: &str, iface_root: &Path) -> Result<bool> {
+    if name == "lo" {
+        return Ok(false);
+    }
+    if !iface_root.join("device").exists() {
+        return Ok(false);
+    }
+    if iface_root.join("master").exists() || iface_root.join("bridge").exists() {
+        return Ok(false);
+    }
+
+    interface_has_queue_entries(iface_root)
+}
+
+fn interface_has_queue_entries(iface_root: &Path) -> Result<bool> {
+    let queue_root = iface_root.join("queues");
+    if !queue_root.exists() {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(&queue_root)
+        .with_context(|| format!("failed to read {}", queue_root.display()))?
+    {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("tx-") || name.starts_with("rx-") {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn split_forwarding_cpus_across_interfaces(
+    forwarding_cpus: &[usize],
+    interface_count: usize,
+) -> Result<Vec<Vec<usize>>> {
+    if interface_count == 0 {
+        return Ok(Vec::new());
+    }
+    if forwarding_cpus.len() < interface_count {
+        anyhow::bail!(
+            "network.auto_discover found {} interfaces, but only {} forwarding CPUs are available",
+            interface_count,
+            forwarding_cpus.len()
+        );
+    }
+
+    let base = forwarding_cpus.len() / interface_count;
+    let remainder = forwarding_cpus.len() % interface_count;
+    let mut start = 0usize;
+    let mut out = Vec::with_capacity(interface_count);
+
+    for idx in 0..interface_count {
+        let len = base + usize::from(idx < remainder);
+        out.push(forwarding_cpus[start..start + len].to_vec());
+        start += len;
+    }
+
+    Ok(out)
 }
 
 fn effective_xps_mode(cfg: &ScxConfig, iface: &ResolvedNetworkInterface) -> XpsMode {
@@ -1040,7 +1177,7 @@ fn read_cpu_thread_siblings(cpu: usize) -> Result<BTreeSet<usize>> {
 pub fn build_network_locality_plans(cfg: &ScxConfig) -> Result<Vec<InterfaceLocalityPlan>> {
     let mut plans = Vec::new();
 
-    for iface in resolved_network_interfaces(cfg) {
+    for iface in resolved_network_interfaces(cfg)? {
         let initial_mode = iface.xps_mode.clone();
         let initial_status = read_interface_locality_status(&iface)?;
         let iface = adapt_xps_mode_to_interface_support(iface, &initial_status);
@@ -1866,19 +2003,29 @@ fn validate_optional_cpu_set(name: &str, cpus: &[usize], online: &BTreeSet<usize
 
 fn validate_network_config(cfg: &ScxConfig) -> Result<()> {
     let network = &cfg.network;
-    if !network.apply_irq_affinity && !network.apply_xps && network.interfaces.is_empty() {
+    let manages_network_locality = network.apply_irq_affinity
+        || network.apply_xps
+        || network.apply_rss_equal
+        || network.apply_combined_channels;
+
+    if !manages_network_locality && network.interfaces.is_empty() && !network.auto_discover {
         return Ok(());
     }
 
-    if network.interfaces.is_empty() {
+    if network.interfaces.is_empty() && !network.auto_discover {
         anyhow::bail!(
-            "network.interfaces is empty, but network.apply_irq_affinity or network.apply_xps is enabled"
+            "network.interfaces is empty and network.auto_discover=false, but network locality management is enabled"
         );
     }
 
     let online = read_online_cpus()?;
+    let resolved = resolved_network_interfaces(cfg)?;
 
-    for iface in resolved_network_interfaces(cfg) {
+    if manages_network_locality && resolved.is_empty() {
+        anyhow::bail!("network.auto_discover is enabled, but no manageable interfaces were found");
+    }
+
+    for iface in resolved {
         validate_optional_cpu_set(
             &format!("network.interfaces[{}].forwarding_cpus", iface.name),
             &iface.forwarding_cpus,
@@ -1929,13 +2076,17 @@ fn parse_cpu_list(raw: &str) -> Result<BTreeSet<usize>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         affinity_list_matches, build_interface_rps_actions, cpu_list_string, cpu_mask_string,
-        effective_active_queue_count, matches_target, parse_cpu_mask,
+        effective_active_queue_count, interface_is_auto_discoverable, matches_target,
+        parse_cpu_mask,
         parse_ethtool_channels_status, parse_ethtool_rss_status, parse_irq_queue_index,
-        parse_ksoftirqd_cpu, resolved_network_interfaces, rss_equal_matches, xps_mask_matches,
+        parse_ksoftirqd_cpu, resolved_network_interfaces, resolved_network_interfaces_at,
+        rss_equal_matches, split_forwarding_cpus_across_interfaces, xps_mask_matches,
         ChannelStatus, CustomBpfSchedulerConfig, DiscoveryConfig, InterfaceLocalityStatus,
         NetworkConfig, PolicyConfig, QueueLocalityState, QueueMappingMode,
         ResolvedNetworkInterface, RpsMode, RssStatus, SchedulerConfig, SchedulerMode, ScxConfig,
@@ -1961,6 +2112,7 @@ mod tests {
             },
             network: NetworkConfig {
                 interfaces: Vec::new(),
+                auto_discover: false,
                 apply_irq_affinity: false,
                 apply_xps: false,
                 apply_rss_equal: false,
@@ -2088,7 +2240,7 @@ interfaces = [
         )
         .unwrap();
 
-        let resolved = resolved_network_interfaces(&cfg);
+        let resolved = resolved_network_interfaces(&cfg).unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "eth0");
         assert_eq!(resolved[0].forwarding_cpus, vec![0, 1, 2, 3]);
@@ -2155,7 +2307,7 @@ dead:beef
         cfg.scheduler.mode = SchedulerMode::CustomBpf;
         cfg.network.interfaces = vec![super::NetworkInterfaceSpec::Name("eth0".into())];
 
-        let resolved = resolved_network_interfaces(&cfg);
+        let resolved = resolved_network_interfaces(&cfg).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].requested_xps_mode, XpsMode::Auto);
         assert_eq!(resolved[0].xps_mode, XpsMode::Cpus);
@@ -2172,10 +2324,68 @@ dead:beef
             apply_affinity: Some(true),
         }];
 
-        let resolved = resolved_network_interfaces(&cfg);
+        let resolved = resolved_network_interfaces(&cfg).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].requested_xps_mode, XpsMode::Auto);
         assert_eq!(resolved[0].xps_mode, XpsMode::Rxqs);
+    }
+
+    #[test]
+    fn auto_discoverable_interfaces_require_physical_queue_backing() {
+        let root = unique_test_dir("auto-discover-eligible");
+        let phys = root.join("ens1");
+        let loopback = root.join("lo");
+        let bridged = root.join("ens2");
+        let virtual_iface = root.join("veth0");
+
+        fs::create_dir_all(phys.join("device")).unwrap();
+        fs::create_dir_all(phys.join("queues/tx-0")).unwrap();
+        fs::create_dir_all(loopback.join("queues/tx-0")).unwrap();
+        fs::create_dir_all(bridged.join("device")).unwrap();
+        fs::create_dir_all(bridged.join("master")).unwrap();
+        fs::create_dir_all(bridged.join("queues/tx-0")).unwrap();
+        fs::create_dir_all(virtual_iface.join("queues/tx-0")).unwrap();
+
+        assert!(interface_is_auto_discoverable("ens1", &phys).unwrap());
+        assert!(!interface_is_auto_discoverable("lo", &loopback).unwrap());
+        assert!(!interface_is_auto_discoverable("ens2", &bridged).unwrap());
+        assert!(!interface_is_auto_discoverable("veth0", &virtual_iface).unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_discover_splits_forwarding_cpus_per_interface() {
+        let root = unique_test_dir("auto-discover-resolve");
+        let ens1 = root.join("ens1");
+        let ens2 = root.join("ens2");
+        let ignored = root.join("veth0");
+
+        fs::create_dir_all(ens1.join("device")).unwrap();
+        fs::create_dir_all(ens1.join("queues/tx-0")).unwrap();
+        fs::create_dir_all(ens2.join("device")).unwrap();
+        fs::create_dir_all(ens2.join("queues/tx-0")).unwrap();
+        fs::create_dir_all(ignored.join("queues/tx-0")).unwrap();
+
+        let mut cfg = test_config();
+        cfg.network.auto_discover = true;
+        cfg.network.apply_xps = true;
+        cfg.policy.forwarding_cpus = vec![0, 2, 4, 6];
+
+        let resolved = resolved_network_interfaces_at(&cfg, &root).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "ens1");
+        assert_eq!(resolved[0].forwarding_cpus, vec![0, 2]);
+        assert_eq!(resolved[1].name, "ens2");
+        assert_eq!(resolved[1].forwarding_cpus, vec![4, 6]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_discover_requires_enough_forwarding_cpus() {
+        let err = split_forwarding_cpus_across_interfaces(&[0, 1], 3).unwrap_err().to_string();
+        assert!(err.contains("network.auto_discover found 3 interfaces"));
     }
 
     #[test]
@@ -2279,5 +2489,15 @@ forwarding_thread_prefixes = ["landscape-forwarder", "pppoe-rx-"]
             cfg.scheduler.custom_bpf.source_file,
             PathBuf::from("./bpf/landscape_scx.bpf.c")
         );
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("landscape-scx-{label}-{nanos}"));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }
