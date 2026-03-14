@@ -12,6 +12,8 @@ A standalone `sched_ext` project tailored for [landscape](https://github.com/Thi
 
 - High-performance eBPF-routing scheduler design:
   [`docs/ebpf-routing-sched-ext-design.md`](./docs/ebpf-routing-sched-ext-design.md)
+- TRex LAN full-switch evaluation:
+  [`docs/trex-lan-full-switch-evaluation.md`](./docs/trex-lan-full-switch-evaluation.md)
 
 ## Workspace Layout
 
