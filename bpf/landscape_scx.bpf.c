@@ -267,6 +267,13 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 				return 0;
 			}
 
+			if (task.class == LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT) {
+				scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), dataplane_slice(task.qid),
+						 enq_flags | SCX_ENQ_PREEMPT);
+				scx_bpf_kick_cpu((s32)task.owner_cpu, SCX_KICK_PREEMPT);
+				return 0;
+			}
+
 			scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), dataplane_slice(task.qid),
 					 enq_flags);
 			return 0;
