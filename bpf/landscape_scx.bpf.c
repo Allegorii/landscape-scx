@@ -31,10 +31,11 @@
 #define LANDSCAPE_PRESSURE_LEVEL_HIGH 2U
 #define LANDSCAPE_HOUSEKEEPING_SLICE (SCX_SLICE_DFL / 4)
 #define LANDSCAPE_BACKGROUND_SLICE (SCX_SLICE_DFL / 8)
-#define LANDSCAPE_URGENT_WAIT_NS 1000000ULL
-#define LANDSCAPE_STRICT_RUN_BUDGET_NS 2000000ULL
-#define LANDSCAPE_SOFTIRQ_RUN_BUDGET_NS 1000000ULL
+#define LANDSCAPE_URGENT_WAIT_NS 4000000ULL
+#define LANDSCAPE_STRICT_RUN_BUDGET_NS 8000000ULL
+#define LANDSCAPE_SOFTIRQ_RUN_BUDGET_NS 4000000ULL
 #define PF_KTHREAD 0x00200000
+#define SCX_KICK_IDLE (1LLU << 0)
 #define SCX_KICK_PREEMPT (1LLU << 1)
 
 #define BPF_STRUCT_OPS(name, args...) SEC("struct_ops/" #name) BPF_PROG(name, ##args)
@@ -311,6 +312,11 @@ static __always_inline bool task_should_use_urgent_dsq(
 	return false;
 }
 
+static __always_inline __u64 dataplane_kick_flags(bool urgent)
+{
+	return urgent ? SCX_KICK_PREEMPT : SCX_KICK_IDLE;
+}
+
 static __always_inline __u64 dataplane_run_budget_ns(
 	const struct landscape_task_ctx *task,
 	struct task_struct *p)
@@ -360,9 +366,12 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (lookup_task_ctx(p, &task)) {
 		if (task_is_dataplane(&task)) {
+			bool urgent = false;
+
 			runtime = ensure_task_runtime_ctx(p, &key);
 			if (runtime && !runtime->runnable_at_ns)
 				runtime->runnable_at_ns = now_ns;
+			urgent = task_should_use_urgent_dsq(&task, runtime, now_ns);
 
 			/*
 			 * Per-CPU kthreads such as ksoftirqd need a separate
@@ -371,22 +380,29 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 			 * long enough to trip sched_ext's watchdog.
 			 */
 			if (task_is_percpu_kthread(p)) {
-				__u64 softirq_dsq = task_should_use_urgent_dsq(&task, runtime, now_ns) ?
-					urgent_dsq_for_qid(task.qid) : softirq_dsq_for_qid(task.qid);
-				__u64 softirq_flags = enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+				__u64 softirq_dsq = urgent ? urgent_dsq_for_qid(task.qid) :
+					softirq_dsq_for_qid(task.qid);
+				__u64 softirq_flags = enq_flags | SCX_ENQ_HEAD;
+
+				if (urgent)
+					softirq_flags |= SCX_ENQ_PREEMPT;
 
 				scx_bpf_dsq_insert(p, softirq_dsq, SCX_SLICE_DFL, softirq_flags);
-				scx_bpf_kick_cpu((s32)task.owner_cpu, SCX_KICK_PREEMPT);
+				scx_bpf_kick_cpu((s32)task.owner_cpu, dataplane_kick_flags(urgent));
 				return 0;
 			}
 
 			if (task.class == LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT) {
-				__u64 worker_dsq = task_should_use_urgent_dsq(&task, runtime, now_ns) ?
-					urgent_dsq_for_qid(task.qid) : dsq_for_qid(task.qid);
+				__u64 worker_dsq = urgent ? urgent_dsq_for_qid(task.qid) :
+					dsq_for_qid(task.qid);
+				__u64 worker_flags = enq_flags;
+
+				if (urgent)
+					worker_flags |= SCX_ENQ_PREEMPT;
 
 				scx_bpf_dsq_insert(p, worker_dsq, dataplane_slice(task.qid),
-						 enq_flags | SCX_ENQ_PREEMPT);
-				scx_bpf_kick_cpu((s32)task.owner_cpu, SCX_KICK_PREEMPT);
+						 worker_flags);
+				scx_bpf_kick_cpu((s32)task.owner_cpu, dataplane_kick_flags(urgent));
 				return 0;
 			}
 
@@ -403,8 +419,8 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 		__u32 cpu = scx_bpf_task_cpu(p);
 
 		scx_bpf_dsq_insert(p, kthread_dsq_for_cpu(cpu), SCX_SLICE_DFL,
-				 enq_flags | SCX_ENQ_PREEMPT);
-		scx_bpf_kick_cpu((s32)cpu, SCX_KICK_PREEMPT);
+				 enq_flags | SCX_ENQ_HEAD);
+		scx_bpf_kick_cpu((s32)cpu, SCX_KICK_IDLE);
 		return 0;
 	}
 
@@ -437,6 +453,9 @@ s32 BPF_STRUCT_OPS(landscape_tick, struct task_struct *p)
 	now_ns = bpf_ktime_get_ns();
 	if (now_ns <= runtime->started_at_ns ||
 	    now_ns - runtime->started_at_ns < budget_ns)
+		return 0;
+
+	if (!task_should_use_urgent_dsq(&task, runtime, now_ns))
 		return 0;
 
 	scx_bpf_kick_cpu((s32)task.owner_cpu, SCX_KICK_PREEMPT);
