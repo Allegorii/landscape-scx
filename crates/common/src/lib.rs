@@ -681,6 +681,30 @@ pub fn try_set_sched_ext(tid: i32) -> Result<()> {
     Err(anyhow::anyhow!("sched_setattr tid={} policy=SCHED_EXT failed: {}", tid, err))
 }
 
+pub fn try_set_sched_other(tid: i32) -> Result<()> {
+    let attr = SchedAttr {
+        size: std::mem::size_of::<SchedAttr>() as u32,
+        sched_policy: libc::SCHED_OTHER as u32,
+        sched_flags: 0,
+        sched_nice: 0,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+        sched_util_min: 0,
+        sched_util_max: 1024,
+    };
+
+    let ret = unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) };
+
+    if ret == 0 {
+        return Ok(());
+    }
+
+    let err = io::Error::last_os_error();
+    Err(anyhow::anyhow!("sched_setattr tid={} policy=SCHED_OTHER failed: {}", tid, err))
+}
+
 pub fn try_set_cpu_affinity(tid: i32, cpus: &[usize]) -> Result<()> {
     if cpus.is_empty() {
         return Ok(());

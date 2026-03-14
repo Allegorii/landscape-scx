@@ -18,11 +18,11 @@ use landscape_scx_common::{
     affinity_list_matches, apply_ethtool_combined_channels, apply_ethtool_rss_equal,
     build_network_locality_plans, desired_locality_cpus, discover_candidates, get_sched_policy,
     irqbalance_conflicts, load_config, parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches,
-    sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config,
-    write_irq_affinity, write_rps_cpus, write_xps_cpus, xps_mask_matches, InterfaceLocalityPlan,
-    LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskClass, LandscapeTaskIntent,
-    LandscapeTaskKind, SchedulerMode, ScxConfig, ScxSwitchMode, ThreadCandidate, ThreadCpuClass,
-    LANDSCAPE_DSQ_BASE,
+    sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, try_set_sched_other,
+    validate_cpu_config, write_irq_affinity, write_rps_cpus, write_xps_cpus, xps_mask_matches,
+    InterfaceLocalityPlan, LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskClass,
+    LandscapeTaskIntent, LandscapeTaskKind, SchedulerMode, ScxConfig, ScxSwitchMode,
+    ThreadCandidate, ThreadCpuClass, SCHED_EXT_POLICY, LANDSCAPE_DSQ_BASE,
 };
 use tracing::{error, info, warn};
 
@@ -1896,6 +1896,8 @@ fn apply_partial_switch_to_candidates(
     let mut sched_ok = 0usize;
     let mut sched_fail = 0usize;
     let mut sched_skip = 0usize;
+    let mut sched_reset_ok = 0usize;
+    let mut sched_reset_fail = 0usize;
     let mut affinity_ok = 0usize;
     let mut affinity_fail = 0usize;
     let mut affinity_skip = 0usize;
@@ -1914,8 +1916,9 @@ fn apply_partial_switch_to_candidates(
             affinity_skip += 1;
         }
 
-        if action.apply_sched_ext {
-            match try_set_sched_ext(c.tid) {
+        let current_policy = get_sched_policy(c.tid).ok();
+        match desired_sched_policy_update(current_policy, &action) {
+            SchedPolicyUpdate::ApplyExt => match try_set_sched_ext(c.tid) {
                 Ok(_) => {
                     sched_ok += 1;
                 }
@@ -1923,22 +1926,34 @@ fn apply_partial_switch_to_candidates(
                     sched_fail += 1;
                     warn!("failed tid={} comm={} err={}", c.tid, c.comm, e);
                 }
+            },
+            SchedPolicyUpdate::ResetOther => match try_set_sched_other(c.tid) {
+                Ok(_) => {
+                    sched_reset_ok += 1;
+                }
+                Err(e) => {
+                    sched_reset_fail += 1;
+                    warn!("failed to reset tid={} comm={} to SCHED_OTHER err={}", c.tid, c.comm, e);
+                }
+            },
+            SchedPolicyUpdate::Skip => {
+                sched_skip += 1;
             }
-        } else {
-            sched_skip += 1;
         }
     }
 
     info!(
-        "partial switch apply finished: sched_ext_success={} sched_ext_failed={} sched_ext_skipped={} affinity_success={} affinity_failed={} affinity_skipped={}",
+        "partial switch apply finished: sched_ext_success={} sched_ext_failed={} sched_other_success={} sched_other_failed={} sched_ext_skipped={} affinity_success={} affinity_failed={} affinity_skipped={}",
         sched_ok,
         sched_fail,
+        sched_reset_ok,
+        sched_reset_fail,
         sched_skip,
         affinity_ok,
         affinity_fail,
         affinity_skip
     );
-    if sched_fail > 0 || affinity_fail > 0 {
+    if sched_fail > 0 || sched_reset_fail > 0 || affinity_fail > 0 {
         warn!("some threads were not switched, verify root permission and sched_ext state");
     }
     Ok(())
@@ -1980,6 +1995,8 @@ fn apply_builtin_switch_to_candidates(
     let mut sched_ok = 0usize;
     let mut sched_fail = 0usize;
     let mut sched_skip = 0usize;
+    let mut sched_reset_ok = 0usize;
+    let mut sched_reset_fail = 0usize;
     let mut affinity_ok = 0usize;
     let mut affinity_fail = 0usize;
     let mut affinity_skip = 0usize;
@@ -2001,8 +2018,9 @@ fn apply_builtin_switch_to_candidates(
             affinity_skip += 1;
         }
 
-        if action.apply_sched_ext {
-            match try_set_sched_ext(c.tid) {
+        let current_policy = get_sched_policy(c.tid).ok();
+        match desired_sched_policy_update(current_policy, &action) {
+            SchedPolicyUpdate::ApplyExt => match try_set_sched_ext(c.tid) {
                 Ok(_) => {
                     sched_ok += 1;
                 }
@@ -2010,22 +2028,34 @@ fn apply_builtin_switch_to_candidates(
                     sched_fail += 1;
                     warn!("failed tid={} comm={} err={}", c.tid, c.comm, e);
                 }
+            },
+            SchedPolicyUpdate::ResetOther => match try_set_sched_other(c.tid) {
+                Ok(_) => {
+                    sched_reset_ok += 1;
+                }
+                Err(e) => {
+                    sched_reset_fail += 1;
+                    warn!("failed to reset tid={} comm={} to SCHED_OTHER err={}", c.tid, c.comm, e);
+                }
+            },
+            SchedPolicyUpdate::Skip => {
+                sched_skip += 1;
             }
-        } else {
-            sched_skip += 1;
         }
     }
 
     info!(
-        "partial switch apply finished: sched_ext_success={} sched_ext_failed={} sched_ext_skipped={} affinity_success={} affinity_failed={} affinity_skipped={}",
+        "partial switch apply finished: sched_ext_success={} sched_ext_failed={} sched_other_success={} sched_other_failed={} sched_ext_skipped={} affinity_success={} affinity_failed={} affinity_skipped={}",
         sched_ok,
         sched_fail,
+        sched_reset_ok,
+        sched_reset_fail,
         sched_skip,
         affinity_ok,
         affinity_fail,
         affinity_skip
     );
-    if sched_fail > 0 || affinity_fail > 0 {
+    if sched_fail > 0 || sched_reset_fail > 0 || affinity_fail > 0 {
         warn!("some threads were not switched, verify root permission and sched_ext state");
     }
     Ok(())
@@ -2197,6 +2227,28 @@ struct ThreadPolicyAction {
     apply_affinity: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedPolicyUpdate {
+    ApplyExt,
+    ResetOther,
+    Skip,
+}
+
+fn desired_sched_policy_update(
+    current_policy: Option<i32>,
+    action: &ThreadPolicyAction,
+) -> SchedPolicyUpdate {
+    if action.apply_sched_ext {
+        return SchedPolicyUpdate::ApplyExt;
+    }
+
+    if current_policy == Some(SCHED_EXT_POLICY as i32) {
+        return SchedPolicyUpdate::ResetOther;
+    }
+
+    SchedPolicyUpdate::Skip
+}
+
 fn builtin_task_policy_action(cfg: &ScxConfig, task: &LandscapeTaskIntent) -> ThreadPolicyAction {
     match task.kind {
         LandscapeTaskKind::Ksoftirqd => ThreadPolicyAction {
@@ -2316,10 +2368,11 @@ mod tests {
     use super::{
         apply_builtin_queue_pressure, build_landscape_scheduler_intent, builtin_task_policy_action,
         collect_irq_totals, collect_reconcile_watch_targets, derive_queue_pressure_levels,
-        parse_proc_connector_event_scope, thread_policy_action, BuiltinPressureTracker,
-        ExecProcEvent, ForkProcEvent, ProcEventHeader, ScxConfig, SoftirqTotals,
-        SoftnetCpuCounters, ThreadCpuClass, PROC_EVENT_EXEC, PROC_EVENT_FORK,
-        QUEUE_PRESSURE_LEVEL_ELEVATED, QUEUE_PRESSURE_LEVEL_HIGH,
+        desired_sched_policy_update, parse_proc_connector_event_scope, thread_policy_action,
+        BuiltinPressureTracker, ExecProcEvent, ForkProcEvent, ProcEventHeader, ScxConfig,
+        SchedPolicyUpdate, SoftirqTotals, SoftnetCpuCounters, ThreadCpuClass,
+        PROC_EVENT_EXEC, PROC_EVENT_FORK, QUEUE_PRESSURE_LEVEL_ELEVATED,
+        QUEUE_PRESSURE_LEVEL_HIGH,
     };
     use landscape_scx_common::{
         InterfaceLocalityPlan, InterfaceLocalityStatus, IrqLocalityState, LandscapeQueueIntent,
@@ -2563,6 +2616,30 @@ mod tests {
         assert_eq!(action.cpus, vec![0]);
         assert!(!action.apply_sched_ext);
         assert!(!action.apply_affinity);
+    }
+
+    #[test]
+    fn stale_sched_ext_thread_is_reset_when_action_skips_sched_ext() {
+        let mut cfg = ScxConfig::default();
+        cfg.scheduler.mode = landscape_scx_common::SchedulerMode::CustomBpf;
+        cfg.scheduler.custom_bpf.switch_mode = ScxSwitchMode::Partial;
+
+        let action = builtin_task_policy_action(&cfg, &LandscapeTaskIntent {
+            pid: 14,
+            tid: 14,
+            start_time_ns: 123_456,
+            comm: "ksoftirqd/0".into(),
+            kind: LandscapeTaskKind::Ksoftirqd,
+            class: LandscapeTaskClass::DataplaneStrict,
+            qid: 0,
+            owner_cpu: 0,
+        });
+
+        assert_eq!(
+            desired_sched_policy_update(Some(landscape_scx_common::SCHED_EXT_POLICY as i32), &action),
+            SchedPolicyUpdate::ResetOther
+        );
+        assert_eq!(desired_sched_policy_update(Some(libc::SCHED_OTHER), &action), SchedPolicyUpdate::Skip);
     }
 
     fn test_pressure_plan(total_q0: u64, total_q1: u64) -> InterfaceLocalityPlan {
