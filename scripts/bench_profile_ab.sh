@@ -204,6 +204,76 @@ config_scheduler_mode() {
   ' "$config_path"
 }
 
+config_custom_bpf_build_dir() {
+  local config_path="$1"
+  awk '
+    BEGIN { in_custom_bpf = 0; build_dir = "" }
+    /^\[scheduler\.custom_bpf\]/ { in_custom_bpf = 1; next }
+    /^\[/ && in_custom_bpf == 1 { in_custom_bpf = 0 }
+    in_custom_bpf == 1 {
+      line = $0
+      sub(/[[:space:]]*#.*/, "", line)
+      pos = index(line, "=")
+      if (pos <= 0) next
+      key = substr(line, 1, pos - 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", key)
+      if (key != "build_dir") next
+      value = substr(line, pos + 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      gsub(/"/, "", value)
+      build_dir = value
+      print build_dir
+      found = 1
+      exit
+    }
+    END {
+      if (!found) print ""
+    }
+  ' "$config_path"
+}
+
+config_apply_interval_secs() {
+  local config_path="$1"
+  awk '
+    BEGIN { in_agent = 0; interval = "" }
+    /^\[agent\]/ { in_agent = 1; next }
+    /^\[/ && in_agent == 1 { in_agent = 0 }
+    in_agent == 1 {
+      line = $0
+      sub(/[[:space:]]*#.*/, "", line)
+      pos = index(line, "=")
+      if (pos <= 0) next
+      key = substr(line, 1, pos - 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", key)
+      if (key != "apply_interval_secs") next
+      value = substr(line, pos + 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      interval = value
+      print interval
+      found = 1
+      exit
+    }
+    END {
+      if (!found) print "5"
+    }
+  ' "$config_path"
+}
+
+config_pressure_report_path() {
+  local config_path="$1"
+  if [[ "$(config_scheduler_mode "$config_path")" != "custom_bpf" ]]; then
+    return 0
+  fi
+
+  local build_dir
+  build_dir="$(config_custom_bpf_build_dir "$config_path")"
+  if [[ -z "$build_dir" ]]; then
+    return 0
+  fi
+
+  printf '%s/pressure.toml\n' "$build_dir"
+}
+
 read_cpu_stat() {
   awk '/^cpu / {total=0; for(i=2;i<=9;i++) total+=$i; busy=$2+$3+$4+$7+$8; print total, busy; exit}' /proc/stat
 }
@@ -493,6 +563,97 @@ perf_available() {
   [[ "$ENABLE_PERF" -eq 1 ]] && command -v perf >/dev/null 2>&1 && [[ -n "$PERF_EVENTS" ]]
 }
 
+read_builtin_pressure_summary() {
+  local report_path="$1"
+  if [[ -z "$report_path" || ! -f "$report_path" ]]; then
+    printf 'na\tna\t0\t0\tnone\n'
+    return 0
+  fi
+
+  awk '
+    function trim(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      return s
+    }
+    function unquote(s) {
+      s = trim(s)
+      gsub(/^"/, "", s)
+      gsub(/"$/, "", s)
+      return s
+    }
+    function flush_queue(    entry, reason_text) {
+      if (!in_queue) return
+      if ((pressure_level + 0) <= 0) return
+
+      elevated += 1
+      if ((pressure_level + 0) >= 2) high += 1
+
+      reason_text = reasons
+      if (reason_text == "") reason_text = "none"
+      entry = sprintf("qid%s:l%s:%s/q%s@cpu%s:%s", qid, pressure_level, interface, queue_index, owner_cpu, reason_text)
+      if (summary != "") summary = summary ";" entry
+      else summary = entry
+    }
+
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+
+    /^\[\[queues\]\]/ {
+      flush_queue()
+      in_queue = 1
+      qid = ""
+      interface = ""
+      queue_index = ""
+      owner_cpu = ""
+      pressure_level = "0"
+      reasons = ""
+      next
+    }
+
+    {
+      line = $0
+      pos = index(line, "=")
+      if (pos <= 0) next
+
+      key = trim(substr(line, 1, pos - 1))
+      value = trim(substr(line, pos + 1))
+
+      if (!in_queue) {
+        if (key == "net_rx_softirq_delta") net_rx = value + 0
+        else if (key == "net_tx_softirq_delta") net_tx = value + 0
+        next
+      }
+
+      if (key == "qid") qid = value + 0
+      else if (key == "interface") interface = unquote(value)
+      else if (key == "queue_index") queue_index = value + 0
+      else if (key == "owner_cpu") owner_cpu = value + 0
+      else if (key == "pressure_level") pressure_level = value + 0
+      else if (key == "reasons") {
+        gsub(/[\[\]"]/, "", value)
+        gsub(/[ \t]+/, "", value)
+        gsub(/,/, "|", value)
+        reasons = value
+      }
+    }
+
+    END {
+      flush_queue()
+      if (summary == "") summary = "none"
+      printf "%s\t%s\t%s\t%s\t%s\n", net_rx + 0, net_tx + 0, elevated + 0, high + 0, summary
+    }
+  ' "$report_path"
+}
+
+stop_case_agent() {
+  local pid="$1"
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+
+  kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+}
+
 failure_row() {
   local case_label="$1"
   local config_path="$2"
@@ -502,7 +663,8 @@ failure_row() {
     "$case_label" "$config_path" "false" "$state" "$ops" \
     "0" "0" "0" "0" "0" "0" "0" "0" "0.00" "0.00" "na" "na" "na" \
     "100.00" "0.00" "0.00" "0.00" \
-    "" "" "" "" "" "" ""
+    "" "" "" "" "" "" "" \
+    "na" "na" "0" "0" "none"
 }
 
 reset_sched_ext_state() {
@@ -526,6 +688,9 @@ run_case() {
   local config_path="$2"
   local scheduler_mode
   scheduler_mode="$(config_scheduler_mode "$config_path")"
+  local pressure_report_path=""
+  local apply_interval_secs="0"
+  local case_agent_pid=""
 
   echo "[case] $case_label" | tee -a "$LOG"
 
@@ -534,9 +699,39 @@ run_case() {
     return 0
   fi
 
-  if ! "$AGENT_BIN" run --config "$config_path" --once >> "$LOG" 2>&1; then
-    failure_row "$case_label" "$config_path" "setup_failed" "unknown" >> "$CSV"
-    return 0
+  if [[ "$scheduler_mode" == "custom_bpf" ]]; then
+    pressure_report_path="$(config_pressure_report_path "$config_path")"
+    apply_interval_secs="$(config_apply_interval_secs "$config_path")"
+    if [[ -n "$pressure_report_path" ]]; then
+      rm -f "$pressure_report_path"
+      echo "[info][$case_label] pressure_report_path=$pressure_report_path apply_interval_secs=$apply_interval_secs" >> "$LOG"
+    fi
+    if [[ "$WARMUP_SECS" -lt "$apply_interval_secs" ]]; then
+      echo "[warn][$case_label] warmup (${WARMUP_SECS}s) is shorter than apply_interval_secs (${apply_interval_secs}s); pressure feedback may still be on its first sample" | tee -a "$LOG"
+    fi
+
+    "$AGENT_BIN" run --config "$config_path" >> "$LOG" 2>&1 &
+    case_agent_pid="$!"
+    cleanup_pids+=("$case_agent_pid")
+
+    local deadline=$((SECONDS + 20))
+    while [[ "$SECONDS" -lt "$deadline" ]]; do
+      if ! kill -0 "$case_agent_pid" >/dev/null 2>&1; then
+        wait "$case_agent_pid" >/dev/null 2>&1 || true
+        failure_row "$case_label" "$config_path" "setup_failed" "unknown" >> "$CSV"
+        return 0
+      fi
+
+      if [[ "$(read_sched_ext_ops)" == "landscape_scx" ]]; then
+        break
+      fi
+      sleep 1
+    done
+  else
+    if ! "$AGENT_BIN" run --config "$config_path" --once >> "$LOG" 2>&1; then
+      failure_row "$case_label" "$config_path" "setup_failed" "unknown" >> "$CSV"
+      return 0
+    fi
   fi
 
   local setup_state setup_ops
@@ -544,6 +739,7 @@ run_case() {
   setup_ops="$(read_sched_ext_ops)"
   if [[ "$scheduler_mode" == "custom_bpf" && "$setup_ops" != "landscape_scx" ]]; then
     echo "[error] $case_label expected landscape_scx, got ops=$setup_ops" | tee -a "$LOG"
+    stop_case_agent "$case_agent_pid"
     failure_row "$case_label" "$config_path" "$setup_state" "$setup_ops" >> "$CSV"
     return 0
   fi
@@ -693,12 +889,30 @@ run_case() {
     rm -f "$perf_out"
   fi
 
+  local pressure_net_rx_delta="na"
+  local pressure_net_tx_delta="na"
+  local pressure_elevated_queues="0"
+  local pressure_high_queues="0"
+  local pressure_queue_summary="none"
+  if [[ -n "$pressure_report_path" ]]; then
+    if [[ -f "$pressure_report_path" ]]; then
+      read -r pressure_net_rx_delta pressure_net_tx_delta pressure_elevated_queues pressure_high_queues pressure_queue_summary \
+        < <(read_builtin_pressure_summary "$pressure_report_path")
+      sed "s/^/[pressure][$case_label] /" "$pressure_report_path" >> "$LOG"
+    else
+      echo "[warn][$case_label] pressure report not found: $pressure_report_path" >> "$LOG"
+    fi
+  fi
+
+  stop_case_agent "$case_agent_pid"
+
   {
     echo "[detail][$case_label] softnet_dropped_delta=$softnet_drop_delta softnet_time_squeeze_delta=$softnet_sq_delta"
     echo "[detail][$case_label] irq_queue_delta_by_iface=$irqq_by_iface"
     echo "[detail][$case_label] ksoftirqd_cpu_secs_by_comm=$ksoft_by_comm"
     echo "[detail][$case_label] irq_thread_cpu_secs_by_comm=$irqthr_by_comm"
     echo "[detail][$case_label] perf_cache_misses=$perf_cache_misses perf_cache_references=$perf_cache_refs perf_llc_load_misses=$perf_llc_misses"
+    echo "[detail][$case_label] pressure_net_rx_softirq_delta=$pressure_net_rx_delta pressure_net_tx_softirq_delta=$pressure_net_tx_delta pressure_elevated_queues=$pressure_elevated_queues pressure_high_queues=$pressure_high_queues pressure_queue_summary=$pressure_queue_summary"
   } >> "$LOG"
 
   csv_row \
@@ -706,7 +920,8 @@ run_case() {
     "$rx_irq_delta" "$tx_irq_delta" "$softnet_drop_delta" "$softnet_sq_delta" "$ctxt_delta" \
     "$ksoft_secs" "$irqthr_secs" "$perf_cache_misses" "$perf_cache_refs" "$perf_llc_misses" \
     "$ping_loss" "$ping_avg" "$ping_p95" "$ping_max" "$rx_by_iface" "$tx_by_iface" \
-    "$irqq_by_iface" "$qlow_by_iface" "$qhigh_by_iface" "$ksoft_by_comm" "$irqthr_by_comm" >> "$CSV"
+    "$irqq_by_iface" "$qlow_by_iface" "$qhigh_by_iface" "$ksoft_by_comm" "$irqthr_by_comm" \
+    "$pressure_net_rx_delta" "$pressure_net_tx_delta" "$pressure_elevated_queues" "$pressure_high_queues" "$pressure_queue_summary" >> "$CSV"
 }
 
 ensure_agent_bin_fresh "$AGENT_BIN"
@@ -716,7 +931,8 @@ csv_row \
   "net_rx_softirq_delta" "net_tx_softirq_delta" "softnet_dropped_delta" "softnet_time_squeeze_delta" \
   "ctxt_delta" "ksoftirqd_cpu_secs" "irq_thread_cpu_secs" "cache_misses" "cache_references" "llc_load_misses" \
   "ping_loss_pct" "ping_avg_ms" "ping_p95_ms" "ping_max_ms" "rx_mbps_by_iface" "tx_mbps_by_iface" \
-  "irq_queue_delta_by_iface" "q0_7_delta_by_iface" "q8plus_delta_by_iface" "ksoftirqd_cpu_secs_by_comm" "irq_thread_cpu_secs_by_comm" > "$CSV"
+  "irq_queue_delta_by_iface" "q0_7_delta_by_iface" "q8plus_delta_by_iface" "ksoftirqd_cpu_secs_by_comm" "irq_thread_cpu_secs_by_comm" \
+  "pressure_net_rx_softirq_delta" "pressure_net_tx_softirq_delta" "pressure_elevated_queues" "pressure_high_queues" "pressure_queue_summary" > "$CSV"
 
 log_header
 run_case "$BASELINE_LABEL" "$BASELINE_CONFIG"

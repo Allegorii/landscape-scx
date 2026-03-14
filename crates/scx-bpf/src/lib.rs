@@ -7,18 +7,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use landscape_scx_common::{
-    LandscapeSchedulerIntent, LandscapeTaskIntent, LandscapeTaskKey, LandscapeTaskKind,
-    SchedulerConfig, SchedulerMode, ScxSwitchMode,
+    LandscapeSchedulerIntent, LandscapeTaskClass, LandscapeTaskIntent, LandscapeTaskKey,
+    LandscapeTaskKind, SchedulerConfig, SchedulerMode, ScxSwitchMode,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
 const LANDSCAPE_TASK_F_DATAPLANE: u32 = 1;
+const LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT: u32 = 0;
+const LANDSCAPE_TASK_CLASS_DATAPLANE_SHARED: u32 = 1;
+const LANDSCAPE_TASK_CLASS_CONTROL_PLANE: u32 = 2;
+const LANDSCAPE_TASK_CLASS_BACKGROUND: u32 = 3;
 const QID_OWNER_MAP_NAME: &str = "qid_owner_map";
 const TASK_CTX_MAP_NAME: &str = "task_ctx_map";
+const QUEUE_PRESSURE_MAP_NAME: &str = "queue_pressure_map";
 const HOUSEKEEPING_CPU_MAP_NAME: &str = "hk_cpu_map";
 const HOUSEKEEPING_DEFAULT_CPU_MAP_NAME: &str = "hk_defcpu_map";
-const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 2;
+const LANDSCAPE_SCHEDULER_SCHEMA_VERSION: u32 = 3;
 const ACTIVE_CUSTOM_BPF_STATE_PATH: &str = "/run/landscape-scx/custom-bpf-active.toml";
 const CUSTOM_BPF_BPFFS_PREFIX: &str = "landscape-scx-";
 
@@ -46,7 +51,14 @@ struct TaskCtxMapValue {
     qid: u32,
     owner_cpu: u32,
     flags: u32,
-    reserved: u32,
+    class: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueuePressureMapValue {
+    pressure_level: u32,
+    reserved0: u32,
+    reserved1: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,8 +196,13 @@ pub fn describe_landscape_scheduler_intent(intent: &LandscapeSchedulerIntent) ->
     out.push_str(&format!("  queues={}\n", intent.queues.len()));
     for queue in &intent.queues {
         out.push_str(&format!(
-            "    qid={} iface={} queue={} owner_cpu={} dsq=0x{:x}\n",
-            queue.qid, queue.interface, queue.queue_index, queue.owner_cpu, queue.dsq_id
+            "    qid={} iface={} queue={} owner_cpu={} dsq=0x{:x} pressure={}\n",
+            queue.qid,
+            queue.interface,
+            queue.queue_index,
+            queue.owner_cpu,
+            queue.dsq_id,
+            queue.pressure_level
         ));
     }
 
@@ -207,8 +224,15 @@ pub fn describe_landscape_scheduler_intent(intent: &LandscapeSchedulerIntent) ->
     ));
     for task in &intent.tasks {
         out.push_str(&format!(
-            "    tid={} pid={} start_time_ns={} kind={:?} comm={} qid={} owner_cpu={}\n",
-            task.tid, task.pid, task.start_time_ns, task.kind, task.comm, task.qid, task.owner_cpu
+            "    tid={} pid={} start_time_ns={} kind={:?} class={:?} comm={} qid={} owner_cpu={}\n",
+            task.tid,
+            task.pid,
+            task.start_time_ns,
+            task.kind,
+            task.class,
+            task.comm,
+            task.qid,
+            task.owner_cpu
         ));
     }
 
@@ -538,6 +562,7 @@ fn sync_landscape_scheduler_maps_with_previous(
 ) -> Result<()> {
     let qid_owner_path = builtin_qid_owner_map_path(paths);
     let task_ctx_path = builtin_task_ctx_map_path(paths);
+    let queue_pressure_path = builtin_queue_pressure_map_path(paths);
     let housekeeping_cpu_path = builtin_housekeeping_cpu_map_path(paths);
     let housekeeping_default_path = builtin_housekeeping_default_cpu_map_path(paths);
     let current_qid_owners = qid_owner_entries_from_intent(intent)?;
@@ -546,6 +571,9 @@ fn sync_landscape_scheduler_maps_with_previous(
     let current_task_ctx = task_ctx_entries_from_intent(intent)?;
     let previous_task_ctx =
         previous_intent.map(task_ctx_entries_from_intent).transpose()?.unwrap_or_default();
+    let current_queue_pressure = queue_pressure_entries_from_intent(intent);
+    let previous_queue_pressure =
+        previous_intent.map(queue_pressure_entries_from_intent).unwrap_or_default();
     let current_housekeeping_cpus = housekeeping_cpu_entries_from_intent(intent)?;
     let previous_housekeeping_cpus =
         previous_intent.map(housekeeping_cpu_entries_from_intent).transpose()?.unwrap_or_default();
@@ -574,6 +602,19 @@ fn sync_landscape_scheduler_maps_with_previous(
     for task_key in previous_task_ctx.keys() {
         if !current_task_ctx.contains_key(task_key) {
             bpftool_map_delete_pinned(&task_ctx_path, &task_key_bytes(task_key)?)?;
+        }
+    }
+
+    for (qid, value) in &current_queue_pressure {
+        bpftool_map_update_pinned(
+            &queue_pressure_path,
+            &qid.to_ne_bytes(),
+            &queue_pressure_value_bytes(*value),
+        )?;
+    }
+    for qid in previous_queue_pressure.keys() {
+        if !current_queue_pressure.contains_key(qid) {
+            bpftool_map_delete_pinned(&queue_pressure_path, &qid.to_ne_bytes())?;
         }
     }
 
@@ -623,11 +664,30 @@ fn task_ctx_entries_from_intent(
                 qid: task.qid,
                 owner_cpu,
                 flags: task_flags(task),
-                reserved: 0,
+                class: task_class(task),
             },
         );
     }
     Ok(entries)
+}
+
+fn queue_pressure_entries_from_intent(
+    intent: &LandscapeSchedulerIntent,
+) -> BTreeMap<u32, QueuePressureMapValue> {
+    intent
+        .queues
+        .iter()
+        .map(|queue| {
+            (
+                queue.qid,
+                QueuePressureMapValue {
+                    pressure_level: queue.pressure_level,
+                    reserved0: 0,
+                    reserved1: 0,
+                },
+            )
+        })
+        .collect()
 }
 
 fn housekeeping_cpu_entries_from_intent(
@@ -653,10 +713,20 @@ fn housekeeping_default_cpu_from_intent(
 }
 
 fn task_flags(task: &LandscapeTaskIntent) -> u32 {
-    match task.kind {
-        LandscapeTaskKind::Ksoftirqd | LandscapeTaskKind::ForwardingWorker => {
+    match task.class {
+        LandscapeTaskClass::DataplaneStrict | LandscapeTaskClass::DataplaneShared => {
             LANDSCAPE_TASK_F_DATAPLANE
         }
+        LandscapeTaskClass::ControlPlane | LandscapeTaskClass::Background => 0,
+    }
+}
+
+fn task_class(task: &LandscapeTaskIntent) -> u32 {
+    match task.class {
+        LandscapeTaskClass::DataplaneStrict => LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT,
+        LandscapeTaskClass::DataplaneShared => LANDSCAPE_TASK_CLASS_DATAPLANE_SHARED,
+        LandscapeTaskClass::ControlPlane => LANDSCAPE_TASK_CLASS_CONTROL_PLANE,
+        LandscapeTaskClass::Background => LANDSCAPE_TASK_CLASS_BACKGROUND,
     }
 }
 
@@ -667,6 +737,10 @@ fn pin_landscape_scheduler_maps(paths: &BuiltinSchedulerPaths) -> Result<()> {
 
     pin_landscape_scheduler_map_by_name(QID_OWNER_MAP_NAME, &builtin_qid_owner_map_path(paths))?;
     pin_landscape_scheduler_map_by_name(TASK_CTX_MAP_NAME, &builtin_task_ctx_map_path(paths))?;
+    pin_landscape_scheduler_map_by_name(
+        QUEUE_PRESSURE_MAP_NAME,
+        &builtin_queue_pressure_map_path(paths),
+    )?;
     pin_landscape_scheduler_map_by_name(
         HOUSEKEEPING_CPU_MAP_NAME,
         &builtin_housekeeping_cpu_map_path(paths),
@@ -809,7 +883,15 @@ fn task_ctx_value_bytes(value: TaskCtxMapValue) -> Vec<u8> {
     bytes.extend_from_slice(&value.qid.to_ne_bytes());
     bytes.extend_from_slice(&value.owner_cpu.to_ne_bytes());
     bytes.extend_from_slice(&value.flags.to_ne_bytes());
-    bytes.extend_from_slice(&value.reserved.to_ne_bytes());
+    bytes.extend_from_slice(&value.class.to_ne_bytes());
+    bytes
+}
+
+fn queue_pressure_value_bytes(value: QueuePressureMapValue) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&value.pressure_level.to_ne_bytes());
+    bytes.extend_from_slice(&value.reserved0.to_ne_bytes());
+    bytes.extend_from_slice(&value.reserved1.to_ne_bytes());
     bytes
 }
 
@@ -840,6 +922,7 @@ fn builtin_map_dir(paths: &BuiltinSchedulerPaths) -> PathBuf {
 fn builtin_map_pins_ready(paths: &BuiltinSchedulerPaths) -> bool {
     builtin_qid_owner_map_path(paths).exists()
         && builtin_task_ctx_map_path(paths).exists()
+        && builtin_queue_pressure_map_path(paths).exists()
         && builtin_housekeeping_cpu_map_path(paths).exists()
         && builtin_housekeeping_default_cpu_map_path(paths).exists()
 }
@@ -850,6 +933,10 @@ fn builtin_qid_owner_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
 
 fn builtin_task_ctx_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
     builtin_map_dir(paths).join(TASK_CTX_MAP_NAME)
+}
+
+fn builtin_queue_pressure_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
+    builtin_map_dir(paths).join(QUEUE_PRESSURE_MAP_NAME)
 }
 
 fn builtin_housekeeping_cpu_map_path(paths: &BuiltinSchedulerPaths) -> PathBuf {
@@ -1051,10 +1138,13 @@ fn target_arch_define() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::render_autogen_header;
+    use super::{
+        queue_pressure_entries_from_intent, render_autogen_header, task_class,
+        task_ctx_entries_from_intent, LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT,
+    };
     use landscape_scx_common::{
-        LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskIntent, LandscapeTaskKind,
-        ScxSwitchMode,
+        LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskClass, LandscapeTaskIntent,
+        LandscapeTaskKind, ScxSwitchMode,
     };
 
     #[test]
@@ -1068,6 +1158,7 @@ mod tests {
                 queue_index: 0,
                 owner_cpu: 2,
                 dsq_id: 0x1000,
+                pressure_level: 2,
             }],
             tasks: vec![LandscapeTaskIntent {
                 pid: 1,
@@ -1075,6 +1166,7 @@ mod tests {
                 start_time_ns: 123,
                 comm: "ksoftirqd/2".into(),
                 kind: LandscapeTaskKind::Ksoftirqd,
+                class: LandscapeTaskClass::DataplaneStrict,
                 qid: 0,
                 owner_cpu: 2,
             }],
@@ -1085,5 +1177,56 @@ mod tests {
         assert!(!header.contains("LANDSCAPE_GEN_QUEUE_COUNT"));
         assert!(!header.contains("LANDSCAPE_GEN_TASK_COUNT"));
         assert!(!header.contains("LANDSCAPE_TASK_F_DATAPLANE"));
+    }
+
+    #[test]
+    fn task_ctx_entries_encode_class() {
+        let intent = LandscapeSchedulerIntent {
+            switch_mode: ScxSwitchMode::Partial,
+            housekeeping_cpus: vec![0],
+            queues: vec![LandscapeQueueIntent {
+                qid: 7,
+                interface: "eth0".into(),
+                queue_index: 0,
+                owner_cpu: 3,
+                dsq_id: 0x1007,
+                pressure_level: 0,
+            }],
+            tasks: vec![LandscapeTaskIntent {
+                pid: 10,
+                tid: 11,
+                start_time_ns: 12,
+                comm: "worker".into(),
+                kind: LandscapeTaskKind::ForwardingWorker,
+                class: LandscapeTaskClass::DataplaneStrict,
+                qid: 7,
+                owner_cpu: 3,
+            }],
+        };
+
+        let entries = task_ctx_entries_from_intent(&intent).expect("task ctx entries");
+        let value = entries.values().next().expect("task ctx value");
+        assert_eq!(value.class, LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT);
+        assert_eq!(task_class(&intent.tasks[0]), LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT);
+    }
+
+    #[test]
+    fn queue_pressure_entries_follow_queue_intent() {
+        let intent = LandscapeSchedulerIntent {
+            switch_mode: ScxSwitchMode::Partial,
+            housekeeping_cpus: vec![0],
+            queues: vec![LandscapeQueueIntent {
+                qid: 9,
+                interface: "eth1".into(),
+                queue_index: 1,
+                owner_cpu: 4,
+                dsq_id: 0x1009,
+                pressure_level: 3,
+            }],
+            tasks: Vec::new(),
+        };
+
+        let entries = queue_pressure_entries_from_intent(&intent);
+        assert_eq!(entries.get(&9).expect("pressure entry").pressure_level, 3);
     }
 }

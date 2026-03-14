@@ -20,8 +20,9 @@ use landscape_scx_common::{
     irqbalance_conflicts, load_config, parse_ksoftirqd_cpu, read_online_cpus, rss_equal_matches,
     sched_policy_name, try_set_cpu_affinity, try_set_sched_ext, validate_cpu_config,
     write_irq_affinity, write_rps_cpus, write_xps_cpus, xps_mask_matches, InterfaceLocalityPlan,
-    LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskIntent, LandscapeTaskKind,
-    SchedulerMode, ScxConfig, ThreadCandidate, ThreadCpuClass, LANDSCAPE_DSQ_BASE,
+    LandscapeQueueIntent, LandscapeSchedulerIntent, LandscapeTaskClass, LandscapeTaskIntent,
+    LandscapeTaskKind, SchedulerMode, ScxConfig, ThreadCandidate, ThreadCpuClass,
+    LANDSCAPE_DSQ_BASE,
 };
 use tracing::{error, info, warn};
 
@@ -69,6 +70,10 @@ enum ReconcileTrigger {
     Event,
     Interval,
 }
+
+const QUEUE_PRESSURE_LEVEL_NONE: u32 = 0;
+const QUEUE_PRESSURE_LEVEL_ELEVATED: u32 = 1;
+const QUEUE_PRESSURE_LEVEL_HIGH: u32 = 2;
 
 impl ReconcileTrigger {
     fn as_str(self) -> &'static str {
@@ -348,7 +353,13 @@ impl ProcConnectorWatcher {
             return Ok(None);
         }
 
-        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_CONNECTOR) };
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                libc::NETLINK_CONNECTOR,
+            )
+        };
         if fd < 0 {
             return Err(anyhow::anyhow!(
                 "proc connector socket creation failed: {}",
@@ -461,7 +472,9 @@ impl ProcConnectorWatcher {
         let mut buf = [0u8; 8192];
         let mut triggered = false;
         loop {
-            let rc = unsafe { libc::recv(self.fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+            let rc = unsafe {
+                libc::recv(self.fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT)
+            };
             if rc == 0 {
                 return Ok(triggered);
             }
@@ -489,7 +502,8 @@ impl ProcConnectorWatcher {
                 }
 
                 if header.nlmsg_type == NLMSG_DONE {
-                    let payload = &buf[offset + std::mem::size_of::<NetlinkMessageHeader>()..offset + message_len];
+                    let payload = &buf[offset + std::mem::size_of::<NetlinkMessageHeader>()
+                        ..offset + message_len];
                     if self.message_matches_scope(payload) {
                         triggered = true;
                     }
@@ -676,6 +690,9 @@ fn status(config: PathBuf) -> Result<()> {
     print_network_status(&cfg)?;
     if let Some(prepared) = &prepared {
         print!("{}", describe_landscape_scheduler_intent(&prepared.intent));
+        if let Some(report) = read_builtin_pressure_report(&cfg)? {
+            print!("{}", format_builtin_pressure_report(&report));
+        }
     }
     Ok(())
 }
@@ -716,13 +733,15 @@ fn validate(config: PathBuf) -> Result<()> {
 fn run(config: PathBuf, dry_run: bool, once: bool) -> Result<()> {
     let cfg = load_or_default(config)?;
     validate_cpu_config(&cfg)?;
+    let mut pressure_tracker = matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf)
+        .then(BuiltinPressureTracker::default);
 
     if !dry_run && !matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
         ensure_scheduler_with_fallback(&cfg)?;
     }
 
     loop {
-        let candidates = reconcile_once(&cfg, dry_run)?;
+        let candidates = reconcile_once_with_pressure(&cfg, dry_run, pressure_tracker.as_mut())?;
         if once {
             break;
         }
@@ -761,19 +780,49 @@ fn discover_agent_candidates(cfg: &ScxConfig) -> Result<Vec<ThreadCandidate>> {
         .collect())
 }
 
-fn reconcile_once(cfg: &ScxConfig, dry_run: bool) -> Result<Vec<ThreadCandidate>> {
+fn reconcile_once_with_pressure(
+    cfg: &ScxConfig,
+    dry_run: bool,
+    pressure_tracker: Option<&mut BuiltinPressureTracker>,
+) -> Result<Vec<ThreadCandidate>> {
     apply_network_locality(cfg, dry_run)?;
 
     if matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
-        let prepared = prepare_builtin_scheduler_runtime(cfg)?;
+        let prepared = prepare_builtin_scheduler_runtime_with_pressure(cfg, pressure_tracker)?;
+        let pressured_queues =
+            prepared.intent.queues.iter().filter(|queue| queue.pressure_level > 0).count();
         info!(
-            "builtin scheduler intent prepared: ops={} queues={} tasks={}",
+            "builtin scheduler intent prepared: ops={} queues={} pressured_queues={} tasks={}",
             read_sched_ext_ops(),
             prepared.intent.queues.len(),
+            pressured_queues,
             prepared.intent.tasks.len()
         );
+        if let Some(report) = &prepared.pressure_report {
+            if let Err(err) = write_builtin_pressure_report(cfg, report) {
+                warn!("failed to write builtin pressure report: {}", err);
+            }
+            for queue in report.queues.iter().filter(|queue| queue.pressure_level > 0) {
+                info!(
+                    "queue_pressure qid={} iface={} queue={} cpu={} level={} irq_delta={} softnet_drop_delta={} softnet_time_squeeze_delta={} ksoftirqd_runtime_delta={} reasons={}",
+                    queue.qid,
+                    queue.interface,
+                    queue.queue_index,
+                    queue.owner_cpu,
+                    queue.pressure_level,
+                    queue.irq_delta,
+                    queue.softnet_dropped_delta,
+                    queue.softnet_time_squeeze_delta,
+                    queue.ksoftirqd_runtime_delta,
+                    queue.reasons.join("|")
+                );
+            }
+        }
         if dry_run {
             print!("{}", describe_landscape_scheduler_intent(&prepared.intent));
+            if let Some(report) = &prepared.pressure_report {
+                print!("{}", format_builtin_pressure_report(report));
+            }
         } else {
             ensure_landscape_scheduler_with_fallback(cfg, &prepared.intent)?;
         }
@@ -1339,15 +1388,486 @@ struct BuiltinSchedulerPrepared {
     candidates: Vec<ThreadCandidate>,
     intent: LandscapeSchedulerIntent,
     selected: Vec<ThreadCandidate>,
+    pressure_report: Option<BuiltinPressureReport>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct BuiltinPressureTracker {
+    previous_irq_totals: BTreeMap<u32, u64>,
+    previous_softnet_counters: BTreeMap<usize, SoftnetCpuCounters>,
+    previous_ksoftirqd_runtime: BTreeMap<usize, u64>,
+    previous_softirq_totals: SoftirqTotals,
+    last_report: Option<BuiltinPressureReport>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SoftnetCpuCounters {
+    dropped: u64,
+    time_squeeze: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SoftirqTotals {
+    net_rx: u64,
+    net_tx: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BuiltinPressureReport {
+    net_rx_softirq_delta: u64,
+    net_tx_softirq_delta: u64,
+    queues: Vec<BuiltinQueuePressureReport>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BuiltinQueuePressureReport {
+    qid: u32,
+    interface: String,
+    queue_index: usize,
+    owner_cpu: usize,
+    pressure_level: u32,
+    irq_delta: u64,
+    task_count: usize,
+    softnet_dropped_delta: u64,
+    softnet_time_squeeze_delta: u64,
+    ksoftirqd_runtime_delta: u64,
+    reasons: Vec<String>,
 }
 
 fn prepare_builtin_scheduler_runtime(cfg: &ScxConfig) -> Result<BuiltinSchedulerPrepared> {
+    prepare_builtin_scheduler_runtime_with_pressure(cfg, None)
+}
+
+fn prepare_builtin_scheduler_runtime_with_pressure(
+    cfg: &ScxConfig,
+    pressure_tracker: Option<&mut BuiltinPressureTracker>,
+) -> Result<BuiltinSchedulerPrepared> {
     let candidates = discover_agent_candidates(cfg)?;
     let plans = build_network_locality_plans(cfg)?;
-    let intent = build_landscape_scheduler_intent(cfg, &plans, &candidates);
+    let mut intent = build_landscape_scheduler_intent(cfg, &plans, &candidates);
+    let pressure_report = apply_builtin_queue_pressure(&mut intent, &plans, pressure_tracker);
     let selected = select_builtin_scheduler_candidates(&intent, &candidates);
 
-    Ok(BuiltinSchedulerPrepared { candidates, intent, selected })
+    Ok(BuiltinSchedulerPrepared { candidates, intent, selected, pressure_report })
+}
+
+fn apply_builtin_queue_pressure(
+    intent: &mut LandscapeSchedulerIntent,
+    plans: &[InterfaceLocalityPlan],
+    pressure_tracker: Option<&mut BuiltinPressureTracker>,
+) -> Option<BuiltinPressureReport> {
+    let Some(tracker) = pressure_tracker else {
+        return None;
+    };
+
+    let current_irq_totals = collect_irq_totals(plans);
+    let current_softnet_counters = read_softnet_cpu_counters();
+    let current_ksoftirqd_runtime = collect_ksoftirqd_runtime_by_cpu(intent);
+    let current_softirq_totals = read_softirq_totals();
+    let pressure_report = derive_queue_pressure_report(
+        intent,
+        plans,
+        &tracker.previous_irq_totals,
+        &current_irq_totals,
+        &tracker.previous_softnet_counters,
+        &current_softnet_counters,
+        &tracker.previous_ksoftirqd_runtime,
+        &current_ksoftirqd_runtime,
+        &tracker.previous_softirq_totals,
+        &current_softirq_totals,
+    );
+
+    for queue in &mut intent.queues {
+        queue.pressure_level = pressure_report
+            .queues
+            .iter()
+            .find(|entry| entry.qid == queue.qid)
+            .map(|entry| entry.pressure_level)
+            .unwrap_or(QUEUE_PRESSURE_LEVEL_NONE);
+    }
+
+    tracker.previous_irq_totals = current_irq_totals;
+    tracker.previous_softnet_counters = current_softnet_counters;
+    tracker.previous_ksoftirqd_runtime = current_ksoftirqd_runtime;
+    tracker.previous_softirq_totals = current_softirq_totals;
+    tracker.last_report = Some(pressure_report.clone());
+    Some(pressure_report)
+}
+
+fn collect_irq_totals(plans: &[InterfaceLocalityPlan]) -> BTreeMap<u32, u64> {
+    let mut totals = BTreeMap::new();
+    for plan in plans {
+        for irq in &plan.status.irqs {
+            totals.insert(irq.irq, irq.total_count);
+        }
+    }
+    totals
+}
+
+fn read_softnet_cpu_counters() -> BTreeMap<usize, SoftnetCpuCounters> {
+    let Ok(raw) = std::fs::read_to_string("/proc/net/softnet_stat") else {
+        return BTreeMap::new();
+    };
+
+    raw.lines()
+        .enumerate()
+        .filter_map(|(cpu, line)| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let dropped = fields.get(1).and_then(|value| u64::from_str_radix(value, 16).ok())?;
+            let time_squeeze =
+                fields.get(2).and_then(|value| u64::from_str_radix(value, 16).ok())?;
+            Some((cpu, SoftnetCpuCounters { dropped, time_squeeze }))
+        })
+        .collect()
+}
+
+fn read_softirq_totals() -> SoftirqTotals {
+    let Ok(raw) = std::fs::read_to_string("/proc/softirqs") else {
+        return SoftirqTotals::default();
+    };
+
+    SoftirqTotals {
+        net_rx: parse_softirq_total(&raw, "NET_RX"),
+        net_tx: parse_softirq_total(&raw, "NET_TX"),
+    }
+}
+
+fn parse_softirq_total(raw: &str, name: &str) -> u64 {
+    raw.lines()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            let prefix = format!("{name}:");
+            if !trimmed.starts_with(&prefix) {
+                return None;
+            }
+            Some(
+                trimmed[prefix.len()..]
+                    .split_whitespace()
+                    .filter_map(|field| field.parse::<u64>().ok())
+                    .sum(),
+            )
+        })
+        .unwrap_or(0)
+}
+
+fn collect_ksoftirqd_runtime_by_cpu(intent: &LandscapeSchedulerIntent) -> BTreeMap<usize, u64> {
+    let mut runtime_by_cpu = BTreeMap::new();
+
+    for task in &intent.tasks {
+        if !matches!(task.kind, LandscapeTaskKind::Ksoftirqd) {
+            continue;
+        }
+
+        let Ok(runtime_ticks) = read_task_runtime_ticks(task.pid, task.tid) else {
+            continue;
+        };
+        runtime_by_cpu.insert(task.owner_cpu, runtime_ticks);
+    }
+
+    runtime_by_cpu
+}
+
+fn read_task_runtime_ticks(pid: i32, tid: i32) -> Result<u64> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"))
+        .with_context(|| format!("failed to read /proc/{pid}/task/{tid}/stat"))?;
+    let Some(comm_end) = raw.rfind(") ") else {
+        anyhow::bail!("missing task stat comm terminator for pid={} tid={}", pid, tid);
+    };
+    let fields = raw[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+    let utime = fields
+        .get(11)
+        .context("missing task stat utime field")?
+        .parse::<u64>()
+        .context("invalid task stat utime field")?;
+    let stime = fields
+        .get(12)
+        .context("missing task stat stime field")?
+        .parse::<u64>()
+        .context("invalid task stat stime field")?;
+    Ok(utime.saturating_add(stime))
+}
+
+fn builtin_pressure_report_path(cfg: &ScxConfig) -> Option<PathBuf> {
+    if !matches!(cfg.scheduler.mode, SchedulerMode::CustomBpf) {
+        return None;
+    }
+    Some(cfg.scheduler.custom_bpf.build_dir.join("pressure.toml"))
+}
+
+fn write_builtin_pressure_report(cfg: &ScxConfig, report: &BuiltinPressureReport) -> Result<()> {
+    let Some(path) = builtin_pressure_report_path(cfg) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, toml::to_string(report).context("failed to serialize pressure report")?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn read_builtin_pressure_report(cfg: &ScxConfig) -> Result<Option<BuiltinPressureReport>> {
+    let Some(path) = builtin_pressure_report_path(cfg) else {
+        return Ok(None);
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let report = toml::from_str(&raw)
+        .with_context(|| format!("failed to parse builtin pressure report {}", path.display()))?;
+    Ok(Some(report))
+}
+
+fn format_builtin_pressure_report(report: &BuiltinPressureReport) -> String {
+    let mut out = String::new();
+    out.push_str("builtin_pressure:\n");
+    out.push_str(&format!(
+        "  net_rx_softirq_delta={} net_tx_softirq_delta={}\n",
+        report.net_rx_softirq_delta, report.net_tx_softirq_delta
+    ));
+    for queue in &report.queues {
+        out.push_str(&format!(
+            "  qid={} iface={} queue={} cpu={} level={} irq_delta={} softnet_drop_delta={} softnet_time_squeeze_delta={} ksoftirqd_runtime_delta={} task_count={} reasons={}\n",
+            queue.qid,
+            queue.interface,
+            queue.queue_index,
+            queue.owner_cpu,
+            queue.pressure_level,
+            queue.irq_delta,
+            queue.softnet_dropped_delta,
+            queue.softnet_time_squeeze_delta,
+            queue.ksoftirqd_runtime_delta,
+            queue.task_count,
+            if queue.reasons.is_empty() { "none".to_string() } else { queue.reasons.join("|") }
+        ));
+    }
+    out
+}
+
+fn softnet_delta(
+    previous: &BTreeMap<usize, SoftnetCpuCounters>,
+    current: &BTreeMap<usize, SoftnetCpuCounters>,
+    cpu: usize,
+) -> SoftnetCpuCounters {
+    let Some(current) = current.get(&cpu) else {
+        return SoftnetCpuCounters::default();
+    };
+    let Some(previous) = previous.get(&cpu) else {
+        return SoftnetCpuCounters::default();
+    };
+
+    SoftnetCpuCounters {
+        dropped: current.dropped.saturating_sub(previous.dropped),
+        time_squeeze: current.time_squeeze.saturating_sub(previous.time_squeeze),
+    }
+}
+
+fn counter_delta(
+    previous: &BTreeMap<usize, u64>,
+    current: &BTreeMap<usize, u64>,
+    key: usize,
+) -> u64 {
+    current
+        .get(&key)
+        .zip(previous.get(&key))
+        .map(|(current, previous)| current.saturating_sub(*previous))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn derive_queue_pressure_levels(
+    intent: &LandscapeSchedulerIntent,
+    plans: &[InterfaceLocalityPlan],
+    previous_irq_totals: &BTreeMap<u32, u64>,
+    current_irq_totals: &BTreeMap<u32, u64>,
+    previous_softnet_counters: &BTreeMap<usize, SoftnetCpuCounters>,
+    current_softnet_counters: &BTreeMap<usize, SoftnetCpuCounters>,
+    previous_ksoftirqd_runtime: &BTreeMap<usize, u64>,
+    current_ksoftirqd_runtime: &BTreeMap<usize, u64>,
+    previous_softirq_totals: &SoftirqTotals,
+    current_softirq_totals: &SoftirqTotals,
+) -> BTreeMap<u32, u32> {
+    derive_queue_pressure_report(
+        intent,
+        plans,
+        previous_irq_totals,
+        current_irq_totals,
+        previous_softnet_counters,
+        current_softnet_counters,
+        previous_ksoftirqd_runtime,
+        current_ksoftirqd_runtime,
+        previous_softirq_totals,
+        current_softirq_totals,
+    )
+    .queues
+    .into_iter()
+    .map(|entry| (entry.qid, entry.pressure_level))
+    .collect()
+}
+
+fn derive_queue_pressure_report(
+    intent: &LandscapeSchedulerIntent,
+    plans: &[InterfaceLocalityPlan],
+    previous_irq_totals: &BTreeMap<u32, u64>,
+    current_irq_totals: &BTreeMap<u32, u64>,
+    previous_softnet_counters: &BTreeMap<usize, SoftnetCpuCounters>,
+    current_softnet_counters: &BTreeMap<usize, SoftnetCpuCounters>,
+    previous_ksoftirqd_runtime: &BTreeMap<usize, u64>,
+    current_ksoftirqd_runtime: &BTreeMap<usize, u64>,
+    previous_softirq_totals: &SoftirqTotals,
+    current_softirq_totals: &SoftirqTotals,
+) -> BuiltinPressureReport {
+    let mut irq_by_queue = BTreeMap::new();
+    for plan in plans {
+        for irq in &plan.status.irqs {
+            let Some(queue_index) = irq.queue_index else {
+                continue;
+            };
+            irq_by_queue.entry((plan.interface.clone(), queue_index)).or_insert(irq.irq);
+        }
+    }
+
+    let mut tasks_per_qid = BTreeMap::new();
+    for task in &intent.tasks {
+        *tasks_per_qid.entry(task.qid).or_insert(0usize) += 1;
+    }
+
+    let mut samples_by_interface = BTreeMap::<String, Vec<(u32, u64, usize)>>::new();
+    for queue in &intent.queues {
+        let irq_delta = irq_by_queue
+            .get(&(queue.interface.clone(), queue.queue_index))
+            .and_then(|irq| {
+                current_irq_totals
+                    .get(irq)
+                    .zip(previous_irq_totals.get(irq))
+                    .map(|(current, previous)| current.saturating_sub(*previous))
+            })
+            .unwrap_or(0);
+        let task_count = tasks_per_qid.get(&queue.qid).copied().unwrap_or(0);
+        samples_by_interface
+            .entry(queue.interface.clone())
+            .or_default()
+            .push((queue.qid, irq_delta, task_count));
+    }
+
+    let net_rx_softirq_delta =
+        current_softirq_totals.net_rx.saturating_sub(previous_softirq_totals.net_rx);
+    let net_tx_softirq_delta =
+        current_softirq_totals.net_tx.saturating_sub(previous_softirq_totals.net_tx);
+    let mut queues = Vec::new();
+    for samples in samples_by_interface.values() {
+        let sample_count = samples.len() as u64;
+        let total_irq_delta = samples.iter().map(|(_, irq_delta, _)| *irq_delta).sum::<u64>();
+        let avg_irq_delta = if sample_count == 0 { 0 } else { total_irq_delta / sample_count };
+
+        for (qid, irq_delta, task_count) in samples {
+            let mut level = QUEUE_PRESSURE_LEVEL_NONE;
+            let owner_cpu = intent
+                .queues
+                .iter()
+                .find(|queue| queue.qid == *qid)
+                .map(|queue| queue.owner_cpu)
+                .unwrap_or(usize::MAX);
+            let softnet =
+                softnet_delta(previous_softnet_counters, current_softnet_counters, owner_cpu);
+            let ksoftirqd_delta =
+                counter_delta(previous_ksoftirqd_runtime, current_ksoftirqd_runtime, owner_cpu);
+            let mut reasons = Vec::new();
+
+            if *task_count >= 2 && *irq_delta > 0 {
+                level = QUEUE_PRESSURE_LEVEL_ELEVATED;
+                reasons.push("dataplane_task_density".into());
+            }
+
+            if softnet.time_squeeze > 0 {
+                level = level.max(QUEUE_PRESSURE_LEVEL_ELEVATED);
+                reasons.push("softnet_time_squeeze".into());
+            }
+            if softnet.time_squeeze >= 8 {
+                level = level.max(QUEUE_PRESSURE_LEVEL_HIGH);
+                reasons.push("softnet_time_squeeze_high".into());
+            }
+            if softnet.dropped > 0 {
+                level = level.max(QUEUE_PRESSURE_LEVEL_HIGH);
+                reasons.push("softnet_drop".into());
+            }
+            if ksoftirqd_delta >= 10 && *irq_delta > 0 {
+                level = level.max(QUEUE_PRESSURE_LEVEL_ELEVATED);
+                reasons.push("ksoftirqd_runtime".into());
+            }
+            if ksoftirqd_delta >= 50 {
+                level = level.max(QUEUE_PRESSURE_LEVEL_HIGH);
+                reasons.push("ksoftirqd_runtime_high".into());
+            }
+
+            if avg_irq_delta > 0 {
+                if *irq_delta >= avg_irq_delta.saturating_mul(3) / 2
+                    && irq_delta.saturating_sub(avg_irq_delta) >= 256
+                {
+                    level = level.max(QUEUE_PRESSURE_LEVEL_ELEVATED);
+                    reasons.push("irq_imbalance".into());
+                }
+                if *irq_delta >= avg_irq_delta.saturating_mul(2)
+                    && irq_delta.saturating_sub(avg_irq_delta) >= 1024
+                {
+                    level = level.max(QUEUE_PRESSURE_LEVEL_HIGH);
+                    reasons.push("irq_imbalance_high".into());
+                }
+            } else if sample_count == 1 {
+                if *irq_delta >= 8_192 {
+                    level = level.max(QUEUE_PRESSURE_LEVEL_ELEVATED);
+                    reasons.push("single_queue_irq_busy".into());
+                }
+                if *irq_delta >= 65_536 {
+                    level = level.max(QUEUE_PRESSURE_LEVEL_HIGH);
+                    reasons.push("single_queue_irq_busy_high".into());
+                }
+            }
+
+            if sample_count == 1
+                && net_rx_softirq_delta.saturating_add(net_tx_softirq_delta) >= 8_192
+                && *irq_delta > 0
+            {
+                level = level.max(QUEUE_PRESSURE_LEVEL_ELEVATED);
+                reasons.push("global_softirq_activity".into());
+            }
+            if sample_count == 1 && net_rx_softirq_delta >= 65_536 && *irq_delta >= 4_096 {
+                level = level.max(QUEUE_PRESSURE_LEVEL_HIGH);
+                reasons.push("global_net_rx_high".into());
+            }
+
+            reasons.sort();
+            reasons.dedup();
+            let queue = intent.queues.iter().find(|queue| queue.qid == *qid).cloned().unwrap_or(
+                LandscapeQueueIntent {
+                    qid: *qid,
+                    interface: String::new(),
+                    queue_index: 0,
+                    owner_cpu,
+                    dsq_id: 0,
+                    pressure_level: 0,
+                },
+            );
+
+            queues.push(BuiltinQueuePressureReport {
+                qid: *qid,
+                interface: queue.interface,
+                queue_index: queue.queue_index,
+                owner_cpu,
+                pressure_level: level,
+                irq_delta: *irq_delta,
+                task_count: *task_count,
+                softnet_dropped_delta: softnet.dropped,
+                softnet_time_squeeze_delta: softnet.time_squeeze,
+                ksoftirqd_runtime_delta: ksoftirqd_delta,
+                reasons,
+            });
+        }
+    }
+
+    queues.sort_by(|a, b| a.qid.cmp(&b.qid));
+    BuiltinPressureReport { net_rx_softirq_delta, net_tx_softirq_delta, queues }
 }
 
 fn apply_partial_switch_to_candidates(
@@ -1540,6 +2060,7 @@ fn build_landscape_scheduler_intent(
                 queue_index,
                 owner_cpu,
                 dsq_id: LANDSCAPE_DSQ_BASE + qid as u64,
+                pressure_level: 0,
             });
             qid += 1;
         }
@@ -1555,6 +2076,7 @@ fn build_landscape_scheduler_intent(
                 start_time_ns: candidate.start_time_ns,
                 comm: candidate.comm.clone(),
                 kind: LandscapeTaskKind::Ksoftirqd,
+                class: LandscapeTaskClass::DataplaneStrict,
                 qid,
                 owner_cpu: cpu,
             })
@@ -1637,6 +2159,7 @@ fn resolve_forwarding_worker_intent(
             start_time_ns: candidate.start_time_ns,
             comm: candidate.comm.clone(),
             kind: LandscapeTaskKind::ForwardingWorker,
+            class: LandscapeTaskClass::DataplaneStrict,
             qid,
             owner_cpu,
         });
@@ -1661,6 +2184,7 @@ fn resolve_forwarding_worker_intent(
         start_time_ns: candidate.start_time_ns,
         comm: candidate.comm.clone(),
         kind: LandscapeTaskKind::ForwardingWorker,
+        class: LandscapeTaskClass::DataplaneStrict,
         qid,
         owner_cpu,
     })
@@ -1790,15 +2314,19 @@ fn load_or_default(path: PathBuf) -> Result<ScxConfig> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_landscape_scheduler_intent, builtin_task_policy_action,
-        collect_reconcile_watch_targets, parse_proc_connector_event_scope, thread_policy_action,
-        ExecProcEvent, ForkProcEvent, ProcEventHeader, ScxConfig, ThreadCpuClass,
-        PROC_EVENT_EXEC, PROC_EVENT_FORK,
+        apply_builtin_queue_pressure, build_landscape_scheduler_intent, builtin_task_policy_action,
+        collect_irq_totals, collect_reconcile_watch_targets, derive_queue_pressure_levels,
+        parse_proc_connector_event_scope, thread_policy_action, BuiltinPressureTracker,
+        ExecProcEvent, ForkProcEvent, ProcEventHeader, ScxConfig, SoftirqTotals,
+        SoftnetCpuCounters, ThreadCpuClass, PROC_EVENT_EXEC, PROC_EVENT_FORK,
+        QUEUE_PRESSURE_LEVEL_ELEVATED, QUEUE_PRESSURE_LEVEL_HIGH,
     };
     use landscape_scx_common::{
-        InterfaceLocalityPlan, InterfaceLocalityStatus, LandscapeTaskIntent, LandscapeTaskKind,
-        QueueMappingMode, ThreadCandidate, XpsMode,
+        InterfaceLocalityPlan, InterfaceLocalityStatus, IrqLocalityState, LandscapeQueueIntent,
+        LandscapeSchedulerIntent, LandscapeTaskClass, LandscapeTaskIntent, LandscapeTaskKind,
+        QueueMappingMode, ScxSwitchMode, ThreadCandidate, XpsMode,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn class_can_disable_sched_ext_without_disabling_affinity() {
@@ -1883,8 +2411,10 @@ mod tests {
         let intent = build_landscape_scheduler_intent(&cfg, &[plan], &candidates);
         assert_eq!(intent.housekeeping_cpus, vec![6, 7]);
         assert_eq!(intent.queues.len(), 2);
+        assert_eq!(intent.queues[0].pressure_level, 0);
         assert_eq!(intent.tasks.len(), 2);
         assert_eq!(intent.tasks[0].kind, LandscapeTaskKind::Ksoftirqd);
+        assert_eq!(intent.tasks[0].class, LandscapeTaskClass::DataplaneStrict);
         assert_eq!(intent.tasks[0].qid, 0);
         assert_eq!(intent.tasks[0].owner_cpu, 2);
         assert_eq!(intent.tasks[1].qid, 1);
@@ -1985,6 +2515,7 @@ mod tests {
         let intent = build_landscape_scheduler_intent(&cfg, &plans, &candidates);
         assert_eq!(intent.tasks.len(), 2);
         assert_eq!(intent.tasks[0].kind, LandscapeTaskKind::ForwardingWorker);
+        assert_eq!(intent.tasks[0].class, LandscapeTaskClass::DataplaneStrict);
         assert_eq!(intent.tasks[0].qid, 0);
         assert_eq!(intent.tasks[0].owner_cpu, 0);
         assert_eq!(intent.tasks[1].qid, 2);
@@ -1999,6 +2530,7 @@ mod tests {
             start_time_ns: 123_456,
             comm: "pppd".into(),
             kind: LandscapeTaskKind::ForwardingWorker,
+            class: LandscapeTaskClass::DataplaneStrict,
             qid: 8,
             owner_cpu: 11,
         });
@@ -2006,6 +2538,196 @@ mod tests {
         assert_eq!(action.cpus, vec![11]);
         assert!(action.apply_sched_ext);
         assert!(action.apply_affinity);
+    }
+
+    fn test_pressure_plan(total_q0: u64, total_q1: u64) -> InterfaceLocalityPlan {
+        InterfaceLocalityPlan {
+            interface: "eth0".into(),
+            forwarding_cpus: vec![2, 3],
+            queue_mapping_mode: QueueMappingMode::RoundRobin,
+            xps_mode: XpsMode::Cpus,
+            rps_mode: landscape_scx_common::RpsMode::Auto,
+            apply_rss_equal: false,
+            apply_combined_channels: false,
+            clear_inactive_xps: false,
+            active_queue_count: 2,
+            total_tx_queues: 2,
+            total_rx_queues: 2,
+            total_irqs: 2,
+            status: InterfaceLocalityStatus {
+                interface: "eth0".into(),
+                tx_xps_cpus: Vec::new(),
+                tx_xps_rxqs: Vec::new(),
+                rx_queues: Vec::new(),
+                irqs: vec![
+                    IrqLocalityState {
+                        irq: 100,
+                        label: "eth0-TxRx-0".into(),
+                        queue_index: Some(0),
+                        total_count: total_q0,
+                        affinity_list_path: PathBuf::from("/proc/irq/100/smp_affinity_list"),
+                        affinity_mask_path: PathBuf::from("/proc/irq/100/smp_affinity"),
+                        affinity_list: "2".into(),
+                    },
+                    IrqLocalityState {
+                        irq: 101,
+                        label: "eth0-TxRx-1".into(),
+                        queue_index: Some(1),
+                        total_count: total_q1,
+                        affinity_list_path: PathBuf::from("/proc/irq/101/smp_affinity_list"),
+                        affinity_mask_path: PathBuf::from("/proc/irq/101/smp_affinity"),
+                        affinity_list: "3".into(),
+                    },
+                ],
+                channel_status: None,
+                rss_status: None,
+            },
+            channel_action: None,
+            rss_action: None,
+            xps_actions: Vec::new(),
+            rps_actions: Vec::new(),
+            inactive_xps_actions: Vec::new(),
+            irq_actions: Vec::new(),
+        }
+    }
+
+    fn test_pressure_intent() -> LandscapeSchedulerIntent {
+        LandscapeSchedulerIntent {
+            switch_mode: ScxSwitchMode::Partial,
+            housekeeping_cpus: vec![0, 1],
+            queues: vec![
+                LandscapeQueueIntent {
+                    qid: 0,
+                    interface: "eth0".into(),
+                    queue_index: 0,
+                    owner_cpu: 2000,
+                    dsq_id: 0x1000,
+                    pressure_level: 0,
+                },
+                LandscapeQueueIntent {
+                    qid: 1,
+                    interface: "eth0".into(),
+                    queue_index: 1,
+                    owner_cpu: 2001,
+                    dsq_id: 0x1001,
+                    pressure_level: 0,
+                },
+            ],
+            tasks: vec![
+                LandscapeTaskIntent {
+                    pid: 1000,
+                    tid: 1001,
+                    start_time_ns: 10,
+                    comm: "ksoftirqd/2".into(),
+                    kind: LandscapeTaskKind::Ksoftirqd,
+                    class: LandscapeTaskClass::DataplaneStrict,
+                    qid: 0,
+                    owner_cpu: 2000,
+                },
+                LandscapeTaskIntent {
+                    pid: 1002,
+                    tid: 1003,
+                    start_time_ns: 11,
+                    comm: "forwarder-0".into(),
+                    kind: LandscapeTaskKind::ForwardingWorker,
+                    class: LandscapeTaskClass::DataplaneStrict,
+                    qid: 0,
+                    owner_cpu: 2000,
+                },
+                LandscapeTaskIntent {
+                    pid: 1004,
+                    tid: 1005,
+                    start_time_ns: 12,
+                    comm: "ksoftirqd/3".into(),
+                    kind: LandscapeTaskKind::Ksoftirqd,
+                    class: LandscapeTaskClass::DataplaneStrict,
+                    qid: 1,
+                    owner_cpu: 2001,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn builtin_queue_pressure_uses_second_sample() {
+        let mut tracker = BuiltinPressureTracker::default();
+        let mut first_intent = test_pressure_intent();
+        let first_plans = vec![test_pressure_plan(1_000, 1_000)];
+
+        apply_builtin_queue_pressure(&mut first_intent, &first_plans, Some(&mut tracker));
+        assert_eq!(first_intent.queues[0].pressure_level, 0);
+        assert_eq!(first_intent.queues[1].pressure_level, 0);
+
+        let mut second_intent = test_pressure_intent();
+        let second_plans = vec![test_pressure_plan(21_000, 1_000)];
+
+        apply_builtin_queue_pressure(&mut second_intent, &second_plans, Some(&mut tracker));
+        assert_eq!(second_intent.queues[0].pressure_level, QUEUE_PRESSURE_LEVEL_HIGH);
+        assert_eq!(second_intent.queues[1].pressure_level, 0);
+    }
+
+    #[test]
+    fn builtin_queue_pressure_derives_relative_imbalance() {
+        let intent = test_pressure_intent();
+        let plans = vec![test_pressure_plan(9_000, 1_800)];
+        let previous_irq_totals =
+            std::collections::BTreeMap::from([(100u32, 1_000u64), (101u32, 1_000u64)]);
+        let current_irq_totals = collect_irq_totals(&plans);
+
+        let levels = derive_queue_pressure_levels(
+            &intent,
+            &plans,
+            &previous_irq_totals,
+            &current_irq_totals,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &SoftirqTotals::default(),
+            &SoftirqTotals::default(),
+        );
+
+        assert_eq!(levels.get(&0), Some(&QUEUE_PRESSURE_LEVEL_ELEVATED));
+        assert_eq!(levels.get(&1), Some(&0));
+    }
+
+    #[test]
+    fn builtin_queue_pressure_escalates_on_softnet_and_ksoftirqd_signals() {
+        let intent = test_pressure_intent();
+        let plans = vec![test_pressure_plan(1_500, 1_500)];
+        let previous_irq_totals =
+            std::collections::BTreeMap::from([(100u32, 1_000u64), (101u32, 1_000u64)]);
+        let current_irq_totals = collect_irq_totals(&plans);
+        let previous_softnet = std::collections::BTreeMap::from([
+            (2000usize, SoftnetCpuCounters { dropped: 10, time_squeeze: 20 }),
+            (2001usize, SoftnetCpuCounters { dropped: 0, time_squeeze: 0 }),
+        ]);
+        let current_softnet = std::collections::BTreeMap::from([
+            (2000usize, SoftnetCpuCounters { dropped: 11, time_squeeze: 28 }),
+            (2001usize, SoftnetCpuCounters { dropped: 0, time_squeeze: 0 }),
+        ]);
+        let previous_ksoftirqd =
+            std::collections::BTreeMap::from([(2000usize, 100u64), (2001usize, 0u64)]);
+        let current_ksoftirqd =
+            std::collections::BTreeMap::from([(2000usize, 180u64), (2001usize, 0u64)]);
+        let previous_softirq = SoftirqTotals { net_rx: 1_000, net_tx: 500 };
+        let current_softirq = SoftirqTotals { net_rx: 10_000, net_tx: 2_000 };
+
+        let levels = derive_queue_pressure_levels(
+            &intent,
+            &plans,
+            &previous_irq_totals,
+            &current_irq_totals,
+            &previous_softnet,
+            &current_softnet,
+            &previous_ksoftirqd,
+            &current_ksoftirqd,
+            &previous_softirq,
+            &current_softirq,
+        );
+
+        assert_eq!(levels.get(&0), Some(&QUEUE_PRESSURE_LEVEL_HIGH));
+        assert_eq!(levels.get(&1), Some(&0));
     }
 
     #[test]

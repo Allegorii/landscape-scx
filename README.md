@@ -8,6 +8,11 @@ A standalone `sched_ext` project tailored for [landscape](https://github.com/Thi
 - Keep integration low-coupling: no direct code changes in `landscape` are required.
 - Provide safe fallback to CFS when `sched_ext` is unavailable.
 
+## Design Notes
+
+- High-performance eBPF-routing scheduler design:
+  [`docs/ebpf-routing-sched-ext-design.md`](./docs/ebpf-routing-sched-ext-design.md)
+
 ## Workspace Layout
 
 - `crates/common`: shared config, process/thread discovery, scheduler syscalls.

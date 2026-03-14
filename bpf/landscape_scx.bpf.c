@@ -18,6 +18,15 @@
 #define LANDSCAPE_DSQ_BASE 0x1000ULL
 #define LANDSCAPE_HOUSEKEEPING_DSQ 0x2000ULL
 #define LANDSCAPE_TASK_F_DATAPLANE (1U << 0)
+#define LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT 0U
+#define LANDSCAPE_TASK_CLASS_DATAPLANE_SHARED 1U
+#define LANDSCAPE_TASK_CLASS_CONTROL_PLANE 2U
+#define LANDSCAPE_TASK_CLASS_BACKGROUND 3U
+#define LANDSCAPE_PRESSURE_LEVEL_NONE 0U
+#define LANDSCAPE_PRESSURE_LEVEL_ELEVATED 1U
+#define LANDSCAPE_PRESSURE_LEVEL_HIGH 2U
+#define LANDSCAPE_HOUSEKEEPING_SLICE (SCX_SLICE_DFL / 4)
+#define LANDSCAPE_BACKGROUND_SLICE (SCX_SLICE_DFL / 8)
 
 #define BPF_STRUCT_OPS(name, args...) SEC("struct_ops/" #name) BPF_PROG(name, ##args)
 #define BPF_STRUCT_OPS_SLEEPABLE(name, args...) SEC("struct_ops.s/" #name) BPF_PROG(name, ##args)
@@ -32,13 +41,19 @@ struct landscape_task_ctx {
 	__u32 qid;
 	__u32 owner_cpu;
 	__u32 flags;
-	__u32 reserved;
+	__u32 class;
 };
 
 struct landscape_queue_owner_ctx {
 	__u32 qid;
 	__u32 owner_cpu;
 	__u64 dsq_id;
+};
+
+struct landscape_queue_pressure_ctx {
+	__u32 pressure_level;
+	__u32 reserved0;
+	__u64 reserved1;
 };
 
 struct {
@@ -54,6 +69,13 @@ struct {
 	__type(key, struct landscape_task_key);
 	__type(value, struct landscape_task_ctx);
 } task_ctx_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, LANDSCAPE_MAX_QIDS);
+	__type(key, __u32);
+	__type(value, struct landscape_queue_pressure_ctx);
+} queue_pressure_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -91,6 +113,21 @@ static __always_inline __u64 dsq_for_qid(__u32 qid)
 	return LANDSCAPE_DSQ_BASE + qid;
 }
 
+static __always_inline bool task_class_is_dataplane(__u32 task_class)
+{
+	return task_class == LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT ||
+	       task_class == LANDSCAPE_TASK_CLASS_DATAPLANE_SHARED;
+}
+
+static __always_inline bool task_is_dataplane(const struct landscape_task_ctx *task)
+{
+	if (!task)
+		return false;
+
+	return task_class_is_dataplane(task->class) ||
+	       (task->flags & LANDSCAPE_TASK_F_DATAPLANE);
+}
+
 static __always_inline bool is_housekeeping_cpu(__u32 cpu)
 {
 	__u8 *value;
@@ -113,6 +150,35 @@ static __always_inline bool default_housekeeping_cpu(__u32 *cpu)
 
 	*cpu = *value;
 	return true;
+}
+
+static __always_inline __u32 queue_pressure_level(__u32 qid)
+{
+	struct landscape_queue_pressure_ctx *pressure;
+
+	pressure = bpf_map_lookup_elem(&queue_pressure_map, &qid);
+	if (!pressure)
+		return LANDSCAPE_PRESSURE_LEVEL_NONE;
+
+	return pressure->pressure_level;
+}
+
+static __always_inline __u64 dataplane_slice(__u32 qid)
+{
+	__u32 pressure = queue_pressure_level(qid);
+
+	if (pressure >= LANDSCAPE_PRESSURE_LEVEL_HIGH)
+		return SCX_SLICE_DFL * 4;
+	if (pressure >= LANDSCAPE_PRESSURE_LEVEL_ELEVATED)
+		return SCX_SLICE_DFL * 2;
+	return SCX_SLICE_DFL;
+}
+
+static __always_inline __u64 housekeeping_slice(__u32 task_class)
+{
+	if (task_class == LANDSCAPE_TASK_CLASS_BACKGROUND)
+		return LANDSCAPE_BACKGROUND_SLICE;
+	return LANDSCAPE_HOUSEKEEPING_SLICE;
 }
 
 static __always_inline bool lookup_task_ctx(struct task_struct *p, struct landscape_task_ctx *out)
@@ -141,8 +207,23 @@ s32 BPF_STRUCT_OPS(landscape_select_cpu, struct task_struct *p, s32 prev_cpu, u6
 	__u32 housekeeping_cpu = 0;
 	bool is_idle = false;
 
-	if (lookup_task_ctx(p, &task) && (task.flags & LANDSCAPE_TASK_F_DATAPLANE))
-		return task.owner_cpu;
+	if (lookup_task_ctx(p, &task)) {
+		switch (task.class) {
+		case LANDSCAPE_TASK_CLASS_DATAPLANE_STRICT:
+			return task.owner_cpu;
+		case LANDSCAPE_TASK_CLASS_DATAPLANE_SHARED:
+			if (prev_cpu >= 0 && !is_housekeeping_cpu((__u32)prev_cpu))
+				return prev_cpu;
+			return task.owner_cpu;
+		case LANDSCAPE_TASK_CLASS_CONTROL_PLANE:
+		case LANDSCAPE_TASK_CLASS_BACKGROUND:
+			break;
+		default:
+			if (task_is_dataplane(&task))
+				return task.owner_cpu;
+			break;
+		}
+	}
 
 	if (prev_cpu >= 0 && is_housekeeping_cpu((__u32)prev_cpu))
 		return prev_cpu;
@@ -157,12 +238,20 @@ s32 BPF_STRUCT_OPS(landscape_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct landscape_task_ctx task = {};
 
-	if (lookup_task_ctx(p, &task) && (task.flags & LANDSCAPE_TASK_F_DATAPLANE)) {
-		scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), SCX_SLICE_DFL, enq_flags);
+	if (lookup_task_ctx(p, &task)) {
+		if (task_is_dataplane(&task)) {
+			scx_bpf_dsq_insert(p, dsq_for_qid(task.qid), dataplane_slice(task.qid),
+					 enq_flags);
+			return 0;
+		}
+
+		scx_bpf_dsq_insert(p, LANDSCAPE_HOUSEKEEPING_DSQ,
+				 housekeeping_slice(task.class), enq_flags);
 		return 0;
 	}
 
-	scx_bpf_dsq_insert(p, LANDSCAPE_HOUSEKEEPING_DSQ, SCX_SLICE_DFL, enq_flags);
+	scx_bpf_dsq_insert(p, LANDSCAPE_HOUSEKEEPING_DSQ, LANDSCAPE_HOUSEKEEPING_SLICE,
+			 enq_flags);
 	return 0;
 }
 
@@ -173,6 +262,12 @@ s32 BPF_STRUCT_OPS(landscape_dispatch, s32 cpu, struct task_struct *prev)
 
 	queue = bpf_map_lookup_elem(&qid_owner_map, &owner_cpu);
 	if (queue && scx_bpf_dsq_move_to_local(queue->dsq_id))
+		return 0;
+
+	if (queue && queue_pressure_level(queue->qid) >= LANDSCAPE_PRESSURE_LEVEL_ELEVATED)
+		return 0;
+
+	if (!is_housekeeping_cpu(owner_cpu))
 		return 0;
 
 	/*

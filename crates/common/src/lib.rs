@@ -221,6 +221,8 @@ pub struct LandscapeQueueIntent {
     pub queue_index: usize,
     pub owner_cpu: usize,
     pub dsq_id: u64,
+    #[serde(default)]
+    pub pressure_level: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +232,29 @@ pub enum LandscapeTaskKind {
     ForwardingWorker,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LandscapeTaskClass {
+    DataplaneStrict,
+    DataplaneShared,
+    ControlPlane,
+    Background,
+}
+
+impl Default for LandscapeTaskClass {
+    fn default() -> Self {
+        Self::DataplaneStrict
+    }
+}
+
+impl LandscapeTaskKind {
+    pub fn default_class(&self) -> LandscapeTaskClass {
+        match self {
+            Self::Ksoftirqd | Self::ForwardingWorker => LandscapeTaskClass::DataplaneStrict,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LandscapeTaskIntent {
     pub pid: i32,
@@ -237,6 +262,8 @@ pub struct LandscapeTaskIntent {
     pub start_time_ns: u64,
     pub comm: String,
     pub kind: LandscapeTaskKind,
+    #[serde(default)]
+    pub class: LandscapeTaskClass,
     pub qid: u32,
     pub owner_cpu: usize,
 }
@@ -730,6 +757,7 @@ pub struct IrqLocalityState {
     pub irq: u32,
     pub label: String,
     pub queue_index: Option<usize>,
+    pub total_count: u64,
     pub affinity_list_path: PathBuf,
     pub affinity_mask_path: PathBuf,
     pub affinity_list: String,
@@ -1385,6 +1413,7 @@ fn read_queue_locality_states(
 
 fn read_irq_locality_states(iface: &str) -> Result<Vec<IrqLocalityState>> {
     let raw = fs::read_to_string("/proc/interrupts").context("failed to read /proc/interrupts")?;
+    let cpu_columns = interrupt_cpu_column_count(&raw);
     let mut out = Vec::new();
 
     for line in raw.lines() {
@@ -1400,6 +1429,7 @@ fn read_irq_locality_states(iface: &str) -> Result<Vec<IrqLocalityState>> {
             Ok(v) => v,
             Err(_) => continue,
         };
+        let total_count = parse_interrupt_total_count(rest, cpu_columns);
         let affinity_list_path = PathBuf::from(format!("/proc/irq/{irq}/smp_affinity_list"));
         let affinity_mask_path = PathBuf::from(format!("/proc/irq/{irq}/smp_affinity"));
         let affinity_list = match fs::read_to_string(&affinity_list_path) {
@@ -1424,6 +1454,7 @@ fn read_irq_locality_states(iface: &str) -> Result<Vec<IrqLocalityState>> {
             irq,
             label: label.to_string(),
             queue_index: Some(queue_index),
+            total_count,
             affinity_list_path,
             affinity_mask_path,
             affinity_list,
@@ -1432,6 +1463,17 @@ fn read_irq_locality_states(iface: &str) -> Result<Vec<IrqLocalityState>> {
 
     out.sort_by_key(|irq| (irq.queue_index.unwrap_or(usize::MAX), irq.irq));
     Ok(out)
+}
+
+fn interrupt_cpu_column_count(raw: &str) -> usize {
+    raw.lines()
+        .next()
+        .map(|line| line.split_whitespace().filter(|field| field.starts_with("CPU")).count())
+        .unwrap_or(0)
+}
+
+fn parse_interrupt_total_count(rest: &str, cpu_columns: usize) -> u64 {
+    rest.split_whitespace().take(cpu_columns).filter_map(|field| field.parse::<u64>().ok()).sum()
 }
 
 fn build_interface_xps_actions(
