@@ -325,8 +325,17 @@ This installs:
 
 - `/usr/local/bin/landscape-scx-agent`
 - `/usr/local/bin/landscape-scx`
+- `/usr/local/share/landscape-scx/bpf/landscape_scx.bpf.c`
 - `/etc/landscape-scx/config.toml`
 - `/etc/systemd/system/landscape-scx.service`
+
+By default, a fresh install now seeds `/etc/landscape-scx/config.toml` from
+[`configs/profiles/auto-discover-auto-partition.toml`](./configs/profiles/auto-discover-auto-partition.toml)
+and rewrites `scheduler.custom_bpf.source_file` to the installed absolute BPF
+source path under `/usr/local/share/landscape-scx`.
+
+The installed unit is ordered after `landscape-router.service` and waits an
+additional 60 seconds before starting the agent.
 
 ## Benchmark schedulers
 

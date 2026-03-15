@@ -2,10 +2,12 @@
 Description=landscape sched_ext agent
 After=network-online.target landscape-router.service
 Wants=network-online.target
+Requires=landscape-router.service
 
 [Service]
 Type=simple
 User=root
+ExecStartPre=/usr/bin/sleep 60
 ExecStart=/usr/local/bin/landscape-scx-agent run --config /etc/landscape-scx/config.toml
 ExecStop=/usr/local/bin/landscape-scx-agent unload-scheduler --config /etc/landscape-scx/config.toml
 Restart=always
